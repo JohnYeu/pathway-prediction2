@@ -1,0 +1,17 @@
+outputs/
+tmp_html/
+__pycache__/
+*.pyc
+.DS_Store
+*.tsv
+!refs/kegg_ath_gene_pathway.tsv
+!refs/kegg_compound_list.tsv
+!refs/kegg_compound_pathway.tsv
+!refs/kegg_pathway_ath.tsv
+!refs/kegg_pathway_map.tsv
+refs/ReactomePathwaysRelation.txt
+refs/go-basic.obo
+refs/knapsack_v1.200.03.tar.gz
+refs/pubchem_cid_synonym_filtered
+refs/pubchem_cid_synonym_filtered.gz
+refs/source.tsv.gz
