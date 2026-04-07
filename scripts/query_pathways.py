@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,116 @@ VARIANT_PRIORITY = {
     "singular": 0.95,
     "stereo_stripped": 0.93,
 }
+STEREO_TOKENS = {
+    "d",
+    "l",
+    "dl",
+    "ld",
+    "r",
+    "s",
+    "rs",
+    "sr",
+    "cis",
+    "trans",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+}
+DERIVATIVE_TOKENS = {
+    "phosphate",
+    "diphosphate",
+    "triphosphate",
+    "sulfate",
+    "sulfonate",
+    "glucoside",
+    "glycoside",
+    "acetyl",
+    "methyl",
+    "ethyl",
+    "ester",
+    "amide",
+    "glucuronide",
+    "palmitoyl",
+    "oleoyl",
+}
+SALT_TOKENS = {
+    "sodium",
+    "disodium",
+    "trisodium",
+    "potassium",
+    "dipotassium",
+    "tripotassium",
+    "calcium",
+    "magnesium",
+    "hydrochloride",
+    "hydrobromide",
+    "hydroiodide",
+}
+HYDRATE_TOKENS = {
+    "hydrate",
+    "monohydrate",
+    "dihydrate",
+    "trihydrate",
+    "hemihydrate",
+    "sesquihydrate",
+}
+GENERIC_CLASS_TOKENS = {
+    "lipid",
+    "lipids",
+    "compound",
+    "compounds",
+    "flavonoid",
+    "flavonoids",
+    "glucosinolate",
+    "glucosinolates",
+    "alkaloid",
+    "alkaloids",
+    "sterol",
+    "sterols",
+}
+LOCANT_RE = re.compile(r"\b\d+\b")
+
+
+@dataclass(slots=True)
+class StructureRecord:
+    formula_keys: frozenset[str]
+    inchi_key_prefixes: frozenset[str]
+    inchi_key_fulls: frozenset[str]
+    evidence_sources: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class NameSemantics:
+    stereo_tokens: frozenset[str]
+    locants: frozenset[str]
+    derivative_tokens: frozenset[str]
+    salt_tokens: frozenset[str]
+    hydrate_tokens: frozenset[str]
+    generic_class_tokens: frozenset[str]
+    acid_base_signature: str
+
+    @property
+    def has_sensitive_tokens(self) -> bool:
+        return bool(
+            self.stereo_tokens
+            or self.locants
+            or self.derivative_tokens
+            or self.salt_tokens
+            or self.hydrate_tokens
+            or self.generic_class_tokens
+            or self.acid_base_signature
+        )
+
+
+@dataclass(slots=True)
+class MatchValidation:
+    compatible: bool
+    formula_validated: bool = False
+    inchi_prefix_validated: bool = False
+    inchi_full_validated: bool = False
+    semantic_validated: bool = False
+    block_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -105,7 +216,12 @@ class ResolvedName:
     matched_variant: str
     resolution_score: float
     formula_validated: bool
+    inchi_prefix_validated: bool
+    inchi_full_validated: bool
+    semantic_validated: bool
     formula_blocked_candidates: int
+    semantic_blocked_candidates: int
+    structure_blocked_candidates: int
 
 
 @dataclass(slots=True)
@@ -184,20 +300,201 @@ def load_name_indexes(path: Path):
     return standard_indexes, alias_indexes, primary_records
 
 
-def load_formula_indexes(path: Path):
-    """Load exact-name and compact-name formula lookups."""
+def normalize_inchi_key_prefix(value: str) -> str:
+    """Return the first connectivity block of an InChIKey."""
 
-    exact_index = defaultdict(set)
-    compact_index = defaultdict(set)
+    text = (value or "").strip().upper()
+    if not text:
+        return ""
+    return text.split("-", 1)[0]
+
+
+def summarize_structure_record(
+    formula_keys: set[str],
+    inchi_key_prefixes: set[str],
+    inchi_key_fulls: set[str],
+    evidence_sources: set[str],
+) -> StructureRecord:
+    """Create an immutable structure summary for one normalized name."""
+
+    return StructureRecord(
+        formula_keys=frozenset(value for value in formula_keys if value),
+        inchi_key_prefixes=frozenset(value for value in inchi_key_prefixes if value),
+        inchi_key_fulls=frozenset(value for value in inchi_key_fulls if value),
+        evidence_sources=tuple(sorted(value for value in evidence_sources if value)),
+    )
+
+
+def load_structure_indexes(path: Path):
+    """Load exact-name and compact-name structure lookups."""
+
+    exact_formula_keys = defaultdict(set)
+    compact_formula_keys = defaultdict(set)
+    exact_inchi_key_prefixes = defaultdict(set)
+    compact_inchi_key_prefixes = defaultdict(set)
+    exact_inchi_key_fulls = defaultdict(set)
+    compact_inchi_key_fulls = defaultdict(set)
+    exact_sources = defaultdict(set)
+    compact_sources = defaultdict(set)
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
             formula_keys = {value for value in row["formula_keys"].split(";") if value}
+            inchi_key_prefixes = {value for value in row.get("inchi_key_prefixes", "").split(";") if value}
+            inchi_key_fulls = {value for value in row.get("inchi_key_fulls", "").split(";") if value}
+            evidence_sources = {value for value in row.get("evidence_sources", "").split(";") if value}
             if row["exact_name"]:
-                exact_index[row["exact_name"]].update(formula_keys)
+                exact_formula_keys[row["exact_name"]].update(formula_keys)
+                exact_inchi_key_prefixes[row["exact_name"]].update(inchi_key_prefixes)
+                exact_inchi_key_fulls[row["exact_name"]].update(inchi_key_fulls)
+                exact_sources[row["exact_name"]].update(evidence_sources)
             if row["compact_name"]:
-                compact_index[row["compact_name"]].update(formula_keys)
-    return dict(exact_index), dict(compact_index)
+                compact_formula_keys[row["compact_name"]].update(formula_keys)
+                compact_inchi_key_prefixes[row["compact_name"]].update(inchi_key_prefixes)
+                compact_inchi_key_fulls[row["compact_name"]].update(inchi_key_fulls)
+                compact_sources[row["compact_name"]].update(evidence_sources)
+    exact_index = {
+        key: summarize_structure_record(
+            exact_formula_keys[key],
+            exact_inchi_key_prefixes[key],
+            exact_inchi_key_fulls[key],
+            exact_sources[key],
+        )
+        for key in exact_formula_keys.keys() | exact_inchi_key_prefixes.keys() | exact_inchi_key_fulls.keys()
+    }
+    compact_index = {
+        key: summarize_structure_record(
+            compact_formula_keys[key],
+            compact_inchi_key_prefixes[key],
+            compact_inchi_key_fulls[key],
+            compact_sources[key],
+        )
+        for key in compact_formula_keys.keys() | compact_inchi_key_prefixes.keys() | compact_inchi_key_fulls.keys()
+    }
+    return exact_index, compact_index
+
+
+def infer_acid_base_signature(tokens: tuple[str, ...]) -> str:
+    """Return a conservative acid/base signature from the normalized name."""
+
+    if not tokens:
+        return ""
+    if "acid" in tokens:
+        return "acid"
+    last_token = tokens[-1]
+    if last_token.endswith("ate") and last_token not in DERIVATIVE_TOKENS:
+        return "anion_like"
+    return ""
+
+
+def extract_name_semantics(text: str) -> NameSemantics:
+    """Extract chemistry-sensitive name semantics used to block false typo fixes."""
+
+    normalized = normalize_name(text)
+    tokens = tuple(token for token in normalized.split() if token)
+    return NameSemantics(
+        stereo_tokens=frozenset(token for token in tokens if token in STEREO_TOKENS),
+        locants=frozenset(LOCANT_RE.findall(normalized)),
+        derivative_tokens=frozenset(token for token in tokens if token in DERIVATIVE_TOKENS),
+        salt_tokens=frozenset(token for token in tokens if token in SALT_TOKENS),
+        hydrate_tokens=frozenset(token for token in tokens if token in HYDRATE_TOKENS),
+        generic_class_tokens=frozenset(token for token in tokens if token in GENERIC_CLASS_TOKENS),
+        acid_base_signature=infer_acid_base_signature(tokens),
+    )
+
+
+def semantics_compatible(query_semantics: NameSemantics, candidate_semantics: NameSemantics) -> MatchValidation:
+    """Reject weak matches when chemistry-sensitive name semantics disagree."""
+
+    for left, right, reason in (
+        (query_semantics.stereo_tokens, candidate_semantics.stereo_tokens, "stereo_conflict"),
+        (query_semantics.locants, candidate_semantics.locants, "locant_conflict"),
+        (query_semantics.derivative_tokens, candidate_semantics.derivative_tokens, "derivative_conflict"),
+        (query_semantics.salt_tokens, candidate_semantics.salt_tokens, "salt_conflict"),
+        (query_semantics.hydrate_tokens, candidate_semantics.hydrate_tokens, "hydrate_conflict"),
+        (query_semantics.generic_class_tokens, candidate_semantics.generic_class_tokens, "generic_class_conflict"),
+    ):
+        if left != right and (left or right):
+            return MatchValidation(compatible=False, block_reason=reason)
+    if query_semantics.acid_base_signature != candidate_semantics.acid_base_signature and (
+        query_semantics.acid_base_signature or candidate_semantics.acid_base_signature
+    ):
+        return MatchValidation(compatible=False, block_reason="acid_base_conflict")
+    return MatchValidation(compatible=True, semantic_validated=True)
+
+
+def lookup_structure_record(variants: dict[str, str], exact_index, compact_index) -> StructureRecord | None:
+    """Resolve the richest available structure summary for one name."""
+
+    records = []
+    if variants["exact"] in exact_index:
+        records.append(exact_index[variants["exact"]])
+    if variants["compact"] in compact_index:
+        records.append(compact_index[variants["compact"]])
+    if not records:
+        return None
+    formula_keys = set()
+    inchi_key_prefixes = set()
+    inchi_key_fulls = set()
+    evidence_sources = set()
+    for record in records:
+        formula_keys.update(record.formula_keys)
+        inchi_key_prefixes.update(record.inchi_key_prefixes)
+        inchi_key_fulls.update(record.inchi_key_fulls)
+        evidence_sources.update(record.evidence_sources)
+    return summarize_structure_record(formula_keys, inchi_key_prefixes, inchi_key_fulls, evidence_sources)
+
+
+def validate_match_strength(
+    query: str,
+    query_variants: dict[str, str],
+    candidate_text: str,
+    variant_name: str,
+    structure_index_provider,
+) -> MatchValidation:
+    """Validate weak name matches with semantics, formula, and InChIKey gates."""
+
+    query_semantics = extract_name_semantics(query)
+    candidate_semantics = extract_name_semantics(candidate_text)
+    semantic_result = semantics_compatible(query_semantics, candidate_semantics)
+    if not semantic_result.compatible:
+        return semantic_result
+
+    requires_structure_gate = variant_name in {"stereo_stripped", "compact_formula_edit2"} or query_semantics.has_sensitive_tokens or candidate_semantics.has_sensitive_tokens
+    if not requires_structure_gate:
+        return semantic_result
+
+    exact_index, compact_index = structure_index_provider()
+    query_structure = lookup_structure_record(query_variants, exact_index, compact_index)
+    candidate_structure = lookup_structure_record(build_variants(candidate_text), exact_index, compact_index)
+
+    query_formula_keys = set(query_structure.formula_keys) if query_structure else set()
+    candidate_formula_keys = set(candidate_structure.formula_keys) if candidate_structure else set()
+    if not formula_sets_compatible(query_formula_keys, candidate_formula_keys):
+        return MatchValidation(compatible=False, block_reason="formula_conflict")
+
+    result = MatchValidation(
+        compatible=True,
+        semantic_validated=True,
+        formula_validated=bool(query_formula_keys and candidate_formula_keys and query_formula_keys & candidate_formula_keys),
+    )
+    query_full = set(query_structure.inchi_key_fulls) if query_structure else set()
+    candidate_full = set(candidate_structure.inchi_key_fulls) if candidate_structure else set()
+    if query_full and candidate_full:
+        if query_full & candidate_full:
+            result.inchi_full_validated = True
+            result.inchi_prefix_validated = True
+            return result
+        return MatchValidation(compatible=False, block_reason="inchi_full_conflict")
+
+    query_prefixes = set(query_structure.inchi_key_prefixes) if query_structure else set()
+    candidate_prefixes = set(candidate_structure.inchi_key_prefixes) if candidate_structure else set()
+    if query_prefixes and candidate_prefixes:
+        if query_prefixes & candidate_prefixes:
+            result.inchi_prefix_validated = True
+            return result
+        return MatchValidation(compatible=False, block_reason="inchi_prefix_conflict")
+    return result
 
 
 def load_name_to_kegg(path: Path):
@@ -327,17 +624,21 @@ def load_plant_evidence(path: Path):
     return {compound_id: dict(values) for compound_id, values in evidence.items()}
 
 
-def choose_best_hit(hits, variant_name, stage, best_mapping_score_by_compound):
+def choose_best_hit(hits, variant_name, stage, best_mapping_score_by_compound, validations):
     """Pick the best compound when a standard-name or alias tier produced hits."""
 
     best = None
     for record in hits.values():
+        validation = validations.get(record.compound_id, MatchValidation(compatible=True))
         mapping_score = best_mapping_score_by_compound.get(record.compound_id, 0.0)
         score = (
             VARIANT_PRIORITY[variant_name]
             + (0.16 if stage == "standard_name" else 0.08)
             + ALIAS_SOURCE_WEIGHTS.get(record.source_type, 0.0)
             + (mapping_score * 0.10)
+            + (0.03 if validation.inchi_full_validated else 0.0)
+            + (0.02 if validation.inchi_prefix_validated else 0.0)
+            + (0.01 if validation.formula_validated else 0.0)
         )
         candidate = ResolvedName(
             compound_id=record.compound_id,
@@ -348,8 +649,13 @@ def choose_best_hit(hits, variant_name, stage, best_mapping_score_by_compound):
             match_stage=stage,
             matched_variant=variant_name,
             resolution_score=score,
-            formula_validated=False,
+            formula_validated=validation.formula_validated,
+            inchi_prefix_validated=validation.inchi_prefix_validated,
+            inchi_full_validated=validation.inchi_full_validated,
+            semantic_validated=validation.semantic_validated,
             formula_blocked_candidates=0,
+            semantic_blocked_candidates=0,
+            structure_blocked_candidates=0,
         )
         if best is None or (candidate.resolution_score, candidate.compound_id) > (best.resolution_score, best.compound_id):
             best = candidate
@@ -361,7 +667,7 @@ def resolve_name(
     standard_indexes,
     alias_indexes,
     primary_records,
-    formula_index_provider,
+    structure_index_provider,
     best_mapping_score_by_compound,
 ) -> ResolvedName | None:
     """Run the table-style step-1 name resolution logic."""
@@ -374,7 +680,23 @@ def resolve_name(
             continue
         hits = standard_indexes[variant_name].get(value)
         if hits:
-            return choose_best_hit(hits, variant_name, "standard_name", best_mapping_score_by_compound)
+            validations = {}
+            semantic_blocked = 0
+            structure_blocked = 0
+            for compound_id, record in hits.items():
+                validation = validate_match_strength(query, variants, record.alias, variant_name, structure_index_provider)
+                if validation.compatible:
+                    validations[compound_id] = validation
+                elif validation.block_reason.endswith("_conflict") and validation.block_reason.startswith(("stereo", "locant", "derivative", "salt", "hydrate", "generic", "acid_base")):
+                    semantic_blocked += 1
+                else:
+                    structure_blocked += 1
+            if validations:
+                best = choose_best_hit(hits, variant_name, "standard_name", best_mapping_score_by_compound, validations)
+                if best:
+                    best.semantic_blocked_candidates = semantic_blocked
+                    best.structure_blocked_candidates = structure_blocked
+                    return best
 
     for variant_name in VARIANT_ORDER:
         value = variants[variant_name]
@@ -382,30 +704,53 @@ def resolve_name(
             continue
         hits = alias_indexes[variant_name].get(value)
         if hits:
-            return choose_best_hit(hits, variant_name, "alias_name", best_mapping_score_by_compound)
+            validations = {}
+            semantic_blocked = 0
+            structure_blocked = 0
+            for compound_id, record in hits.items():
+                validation = validate_match_strength(query, variants, record.alias, variant_name, structure_index_provider)
+                if validation.compatible:
+                    validations[compound_id] = validation
+                elif validation.block_reason.endswith("_conflict") and validation.block_reason.startswith(("stereo", "locant", "derivative", "salt", "hydrate", "generic", "acid_base")):
+                    semantic_blocked += 1
+                else:
+                    structure_blocked += 1
+            if validations:
+                best = choose_best_hit(hits, variant_name, "alias_name", best_mapping_score_by_compound, validations)
+                if best:
+                    best.semantic_blocked_candidates = semantic_blocked
+                    best.structure_blocked_candidates = structure_blocked
+                    return best
 
     compact_query = variants["compact"]
     if not compact_query or len(compact_query) < MIN_CHAR_FUZZY_COMPACT_LEN:
         return None
 
-    exact_formula_index, compact_formula_index = formula_index_provider()
-    input_formula_keys = set(compact_formula_index.get(compact_query, set()))
     best = None
-    blocked = 0
+    formula_blocked = 0
+    semantic_blocked = 0
+    structure_blocked = 0
     for primary in primary_records.values():
         if not primary.compact_name:
             continue
         if abs(len(compact_query) - len(primary.compact_name)) > 2:
             continue
-        candidate_formula_keys = set(compact_formula_index.get(primary.compact_name, set()))
         if not char_edit_distance_at_most_two(compact_query, primary.compact_name):
             continue
-        if not formula_sets_compatible(input_formula_keys, candidate_formula_keys):
-            blocked += 1
+        validation = validate_match_strength(query, variants, primary.alias, "compact_formula_edit2", structure_index_provider)
+        if not validation.compatible:
+            if validation.block_reason == "formula_conflict":
+                formula_blocked += 1
+            elif validation.block_reason.endswith("_conflict") and validation.block_reason.startswith(("stereo", "locant", "derivative", "salt", "hydrate", "generic", "acid_base")):
+                semantic_blocked += 1
+            else:
+                structure_blocked += 1
             continue
         mapping_score = best_mapping_score_by_compound.get(primary.compound_id, 0.0)
-        formula_validated = bool(input_formula_keys and candidate_formula_keys and (input_formula_keys & candidate_formula_keys))
-        score = CHAR_EDIT2_BASE_SCORE + 0.16 + (mapping_score * 0.10) + (0.02 if formula_validated else 0.0)
+        score = CHAR_EDIT2_BASE_SCORE + 0.16 + (mapping_score * 0.10)
+        score += 0.02 if validation.formula_validated else 0.0
+        score += 0.03 if validation.inchi_full_validated else 0.0
+        score += 0.02 if validation.inchi_prefix_validated else 0.0
         candidate = ResolvedName(
             compound_id=primary.compound_id,
             chebi_accession=primary.chebi_accession,
@@ -415,8 +760,13 @@ def resolve_name(
             match_stage="fuzzy_typo_correction",
             matched_variant="compact_formula_edit2",
             resolution_score=score,
-            formula_validated=formula_validated,
-            formula_blocked_candidates=blocked,
+            formula_validated=validation.formula_validated,
+            inchi_prefix_validated=validation.inchi_prefix_validated,
+            inchi_full_validated=validation.inchi_full_validated,
+            semantic_validated=validation.semantic_validated,
+            formula_blocked_candidates=formula_blocked,
+            semantic_blocked_candidates=semantic_blocked,
+            structure_blocked_candidates=structure_blocked,
         )
         if best is None or (candidate.resolution_score, candidate.compound_id) > (best.resolution_score, best.compound_id):
             best = candidate
@@ -576,7 +926,12 @@ def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[Ra
     print(f"Match variant: {resolved.matched_variant}")
     if resolved.match_stage == "fuzzy_typo_correction":
         print(f"Formula validated: {'yes' if resolved.formula_validated else 'no'}")
+        print(f"InChIKey prefix validated: {'yes' if resolved.inchi_prefix_validated else 'no'}")
+        print(f"Full InChIKey validated: {'yes' if resolved.inchi_full_validated else 'no'}")
+        print(f"Semantic validation passed: {'yes' if resolved.semantic_validated else 'no'}")
         print(f"Formula-blocked candidates: {resolved.formula_blocked_candidates}")
+        print(f"Semantic-blocked candidates: {resolved.semantic_blocked_candidates}")
+        print(f"Structure-blocked candidates: {resolved.structure_blocked_candidates}")
     if mappings:
         print(
             "KEGG compound IDs: "
@@ -641,8 +996,8 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
     return {
         "metadata": metadata,
         "name_indexes": name_indexes,
-        "formula_indexes": None,
-        "formula_index_path": paths["name_to_formula_index"],
+        "structure_indexes": None,
+        "structure_index_path": paths["name_to_formula_index"],
         "verbose": verbose,
         "mappings_by_name": mappings_by_name,
         "best_mapping_score_by_compound": best_mapping_score_by_compound,
@@ -653,14 +1008,14 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
     }
 
 
-def get_formula_indexes(state):
-    """Load the formula index lazily because only typo correction needs it."""
+def get_structure_indexes(state):
+    """Load the structure index lazily because only weak matches need it."""
 
-    if state["formula_indexes"] is None:
+    if state["structure_indexes"] is None:
         if state.get("verbose"):
-            print("- name-to-formula index (on demand for typo correction)", flush=True)
-        state["formula_indexes"] = load_formula_indexes(state["formula_index_path"])
-    return state["formula_indexes"]
+            print("- name-to-structure index (on demand for weak-match validation)", flush=True)
+        state["structure_indexes"] = load_structure_indexes(state["structure_index_path"])
+    return state["structure_indexes"]
 
 
 def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[MappingRecord], list[RankedPathway]]:
@@ -672,7 +1027,7 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
         standard_indexes,
         alias_indexes,
         primary_records,
-        lambda: get_formula_indexes(state),
+        lambda: get_structure_indexes(state),
         state["best_mapping_score_by_compound"],
     )
     if resolved is None:

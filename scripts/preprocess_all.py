@@ -41,8 +41,17 @@ from process_chebi_to_pathways_v2 import (
 
 
 PREPROCESSED_DIRNAME = "preprocessed"
-VERSION = "preprocess-query-v1"
+VERSION = "preprocess-query-v2"
 PROGRESS_EVERY = 10000
+
+
+def inchi_key_prefix(value: str) -> str:
+    """Return the connectivity block of an InChIKey when available."""
+
+    text = (value or "").strip().upper()
+    if not text:
+        return ""
+    return text.split("-", 1)[0]
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,12 +162,20 @@ def write_name_normalization_index(
 
 
 def aggregate_name_formula_rows(base_aliases, structures, plantcyc_records, lipidmaps_records):
-    """Aggregate normalized names to formula sets for typo validation."""
+    """Aggregate normalized names to lightweight structure signatures.
+
+    The query layer uses this table as the lazy-loaded safety net for weak name
+    matches. It carries coarse structure identity signals:
+
+    - formula_keys: first-pass chemistry compatibility gate
+    - InChIKey full values: exact structure identity when available
+    - InChIKey prefixes: connectivity-level gate when full structure is missing
+    """
 
     rows = {}
 
-    def add_name(name: str, formula_key_value: str, source: str) -> None:
-        if not name or not formula_key_value:
+    def add_name(name: str, formula_key_value: str, inchi_key_value: str, source: str) -> None:
+        if not name:
             return
         variants = build_variants(name)
         key = (variants["exact"], variants["compact"])
@@ -170,39 +187,42 @@ def aggregate_name_formula_rows(base_aliases, structures, plantcyc_records, lipi
                 "exact_name": key[0],
                 "compact_name": key[1],
                 "formula_keys": set(),
+                "inchi_key_prefixes": set(),
+                "inchi_key_fulls": set(),
                 "evidence_sources": set(),
             },
         )
-        entry["formula_keys"].add(formula_key_value)
+        if formula_key_value:
+            entry["formula_keys"].add(formula_key_value)
+        normalized_inchi = (inchi_key_value or "").strip().upper()
+        if normalized_inchi:
+            entry["inchi_key_fulls"].add(normalized_inchi)
+            entry["inchi_key_prefixes"].add(inchi_key_prefix(normalized_inchi))
         entry["evidence_sources"].add(source)
 
     for compound_id, aliases in base_aliases.items():
         structure = structures.get(compound_id)
-        if not structure or not structure.formula_key:
+        if not structure:
             continue
         for alias in aliases:
-            add_name(alias.raw_name, structure.formula_key, "ChEBI")
+            add_name(alias.raw_name, structure.formula_key, structure.standard_inchi_key, "ChEBI")
 
     for record in plantcyc_records.values():
-        if not record.formula_key:
-            continue
-        add_name(record.common_name, record.formula_key, record.source_db)
+        add_name(record.common_name, record.formula_key, "", record.source_db)
         for synonym in sorted(record.synonyms):
-            add_name(synonym, record.formula_key, record.source_db)
+            add_name(synonym, record.formula_key, "", record.source_db)
 
     for record in lipidmaps_records.values():
-        if not record.formula_key:
-            continue
-        add_name(record.common_name, record.formula_key, "LIPID MAPS")
-        add_name(record.systematic_name, record.formula_key, "LIPID MAPS")
+        add_name(record.common_name, record.formula_key, record.inchi_key, "LIPID MAPS")
+        add_name(record.systematic_name, record.formula_key, record.inchi_key, "LIPID MAPS")
         for synonym in sorted(record.synonyms):
-            add_name(synonym, record.formula_key, "LIPID MAPS")
+            add_name(synonym, record.formula_key, record.inchi_key, "LIPID MAPS")
 
     return rows
 
 
 def write_name_to_formula_index(path: Path, rows) -> int:
-    """Write the formula lookup used by query-side fuzzy correction."""
+    """Write the structure lookup used by query-side weak-match validation."""
 
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -212,6 +232,10 @@ def write_name_to_formula_index(path: Path, rows) -> int:
                 "compact_name",
                 "formula_keys",
                 "formula_count",
+                "inchi_key_prefixes",
+                "inchi_key_prefix_count",
+                "inchi_key_fulls",
+                "inchi_key_full_count",
                 "evidence_sources",
             ],
             delimiter="\t",
@@ -225,6 +249,10 @@ def write_name_to_formula_index(path: Path, rows) -> int:
                     "compact_name": entry["compact_name"],
                     "formula_keys": ";".join(sorted(entry["formula_keys"])),
                     "formula_count": len(entry["formula_keys"]),
+                    "inchi_key_prefixes": ";".join(sorted(value for value in entry["inchi_key_prefixes"] if value)),
+                    "inchi_key_prefix_count": len([value for value in entry["inchi_key_prefixes"] if value]),
+                    "inchi_key_fulls": ";".join(sorted(value for value in entry["inchi_key_fulls"] if value)),
+                    "inchi_key_full_count": len([value for value in entry["inchi_key_fulls"] if value]),
                     "evidence_sources": ";".join(sorted(entry["evidence_sources"])),
                 }
             )
@@ -498,6 +526,7 @@ def build_metadata(workdir: Path, output_dir: Path, counts: dict[str, int]) -> d
         "inputs": input_mtimes,
         "notes": [
             "The query pipeline consumes only outputs/preprocessed/* and does not rescan refs/ during interactive or one-shot queries.",
+            "Weak step-1 matches are guarded by formula compatibility, InChIKey connectivity prefixes, and chemistry-sensitive name semantics.",
             "Step 8 similarity fallback and step 9 extra PlantCyc reranking are intentionally excluded from this first query-oriented refactor.",
         ],
     }
