@@ -31,6 +31,11 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    from rdkit import Chem
+except Exception:  # pragma: no cover - optional dependency
+    Chem = None
+
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
@@ -116,6 +121,18 @@ GENERIC_KEGG_MAPS = {"map01100", "map01110", "map01120"}
 EXTERNAL_NAME_MATCH_MAX_RECORDS = 5
 MAX_EXTRA_SYNONYMS_PER_RECORD = 10
 MAX_PUBCHEM_SYNONYMS_PER_CID = 15
+PLANT_BRIDGE_BASE_SCORES = {
+    ("plant_direct_kegg_xref", "AraCyc"): 0.955,
+    ("plant_direct_kegg_xref", "PlantCyc"): 0.935,
+    ("plant_via_chebi", "AraCyc"): 0.930,
+    ("plant_via_chebi", "PlantCyc"): 0.910,
+    ("plant_inchikey_exact", "AraCyc"): 0.920,
+    ("plant_inchikey_exact", "PlantCyc"): 0.900,
+    ("plant_via_pubchem", "AraCyc"): 0.900,
+    ("plant_via_pubchem", "PlantCyc"): 0.880,
+    ("plant_smiles_exact", "AraCyc"): 0.890,
+    ("plant_smiles_exact", "PlantCyc"): 0.870,
+}
 GREEK_MAP = str.maketrans(
     {
         "α": " alpha ",
@@ -232,6 +249,9 @@ class CandidateMapping:
     primary_name_match: bool = False
     has_structure_evidence: bool = False
     used_pubchem_synonym: bool = False
+    plant_bridge_methods: set[str] = field(default_factory=set)
+    plant_bridge_sources: set[str] = field(default_factory=set)
+    arabidopsis_supported: bool = False
 
     def add_evidence(
         self,
@@ -247,6 +267,9 @@ class CandidateMapping:
         external_source: str = "",
         has_structure_evidence: bool = False,
         used_pubchem_synonym: bool = False,
+        plant_bridge_method: str = "",
+        plant_bridge_source: str = "",
+        arabidopsis_supported: bool = False,
     ) -> None:
         """Merge one new piece of evidence into the candidate summary."""
 
@@ -263,8 +286,13 @@ class CandidateMapping:
         self.primary_name_match = self.primary_name_match or primary_name_match
         self.has_structure_evidence = self.has_structure_evidence or has_structure_evidence
         self.used_pubchem_synonym = self.used_pubchem_synonym or used_pubchem_synonym
+        self.arabidopsis_supported = self.arabidopsis_supported or arabidopsis_supported
         if external_source:
             self.external_sources.add(external_source)
+        if plant_bridge_method:
+            self.plant_bridge_methods.add(plant_bridge_method)
+        if plant_bridge_source:
+            self.plant_bridge_sources.add(plant_bridge_source)
 
 
 @dataclass(slots=True)
@@ -284,6 +312,26 @@ class PlantCycCompound:
     kegg_ids: set[str] = field(default_factory=set)
     hmdb_ids: set[str] = field(default_factory=set)
     pathways: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class PlantToKeggBridge:
+    """Aggregated PMN -> KEGG bridge evidence for one compound and KEGG target."""
+
+    compound_id: str
+    chebi_accession: str
+    canonical_name: str
+    plant_db: str
+    plant_compound_id: str
+    kegg_cid: str
+    bridge_method: str
+    bridge_score: float
+    bridge_confidence: str
+    bridge_record_ids: tuple[str, ...]
+    supporting_ids: tuple[str, ...]
+    arabidopsis_supported: bool
+    has_structure_evidence: bool
+    bridge_reason: str
 
 
 @dataclass(slots=True)
@@ -770,6 +818,27 @@ def normalize_inchi_key(value: str) -> str:
     return (value or "").strip().upper()
 
 
+def rdkit_smiles_available() -> bool:
+    """Return whether RDKit-backed SMILES canonicalization is available."""
+
+    return Chem is not None
+
+
+def canonicalize_smiles(value: str) -> str:
+    """Return a canonical isomeric SMILES string when RDKit is available."""
+
+    text = (value or "").strip()
+    if not text or Chem is None:
+        return ""
+    try:
+        molecule = Chem.MolFromSmiles(text)
+        if molecule is None:
+            return ""
+        return Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+    except Exception:
+        return ""
+
+
 def build_kegg_structure_indexes(
     structures: dict[str, StructureInfo],
     xrefs: dict[str, XrefInfo],
@@ -785,32 +854,307 @@ def build_kegg_structure_indexes(
     """
 
     by_inchi_key_full: defaultdict[str, defaultdict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    by_smiles_norm: defaultdict[str, defaultdict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     for compound_id, info in xrefs.items():
         structure = structures.get(compound_id)
         if not structure:
             continue
         inchi_key = normalize_inchi_key(structure.standard_inchi_key)
-        if not inchi_key:
-            continue
+        smiles_norm = canonicalize_smiles(structure.smiles)
         for kegg_id in info.kegg_ids:
-            if KEGG_ID_RE.fullmatch(kegg_id):
+            if not KEGG_ID_RE.fullmatch(kegg_id):
+                continue
+            if inchi_key:
                 by_inchi_key_full[inchi_key][kegg_id].add("ChEBI")
+            if smiles_norm:
+                by_smiles_norm[smiles_norm][kegg_id].add("ChEBI")
 
     for record in lipidmaps_records.values():
         inchi_key = normalize_inchi_key(record.inchi_key)
         if not inchi_key:
-            continue
+            smiles_norm = canonicalize_smiles(record.smiles)
+        else:
+            smiles_norm = canonicalize_smiles(record.smiles)
         for kegg_id in record.kegg_ids:
-            if KEGG_ID_RE.fullmatch(kegg_id):
+            if not KEGG_ID_RE.fullmatch(kegg_id):
+                continue
+            if inchi_key:
                 by_inchi_key_full[inchi_key][kegg_id].add("LIPID MAPS")
+            if smiles_norm:
+                by_smiles_norm[smiles_norm][kegg_id].add("LIPID MAPS")
 
     return {
         "by_inchi_key_full": {
             inchi_key: {kegg_id: set(sources) for kegg_id, sources in hits.items()}
             for inchi_key, hits in by_inchi_key_full.items()
-        }
+        },
+        "by_smiles_norm": {
+            smiles_norm: {kegg_id: set(sources) for kegg_id, sources in hits.items()}
+            for smiles_norm, hits in by_smiles_norm.items()
+        },
     }
+
+
+def build_plantcyc_compound_index(
+    plantcyc_records: dict[str, PlantCycCompound],
+) -> list[dict[str, object]]:
+    """Flatten PMN compound rows into an audit/index table for step 2."""
+
+    rows: list[dict[str, object]] = []
+    for record_id in sorted(plantcyc_records):
+        record = plantcyc_records[record_id]
+        variants = build_variants(record.common_name)
+        rows.append(
+            {
+                "plant_db": record.source_db,
+                "plant_compound_id": record.compound_id,
+                "canonical_name": record.common_name,
+                "name_norm_exact": variants["exact"],
+                "name_norm_compact": variants["compact"],
+                "name_norm_singular": variants["singular"],
+                "synonym_list": ";".join(sorted(record.synonyms)),
+                "formula": record.formula,
+                "formula_key": record.formula_key,
+                "smiles_raw": record.smiles,
+                "smiles_norm": canonicalize_smiles(record.smiles),
+                "inchi_key_full": "",
+                "chebi_ids": ";".join(sorted(record.chebi_ids)),
+                "pubchem_cids": ";".join(sorted(record.pubchem_cids)),
+                "kegg_ids": ";".join(sorted(record.kegg_ids)),
+                "hmdb_ids": ";".join(sorted(record.hmdb_ids)),
+                "pathway_count": len(record.pathways),
+                "pathway_examples": ";".join(sorted(record.pathways)[:3]),
+                "arabidopsis_supported": str(record.source_db == "AraCyc").lower(),
+            }
+        )
+    return rows
+
+
+def build_kegg_structure_index(
+    structures: dict[str, StructureInfo],
+    xrefs: dict[str, XrefInfo],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+) -> list[dict[str, object]]:
+    """Flatten the KEGG structure bridge table used by PMN structure rescue."""
+
+    rows: list[dict[str, object]] = []
+    indexes = build_kegg_structure_indexes(structures, xrefs, lipidmaps_records)
+    merged: dict[tuple[str, str, str], set[str]] = {}
+
+    for inchi_key, hits in indexes.get("by_inchi_key_full", {}).items():
+        for kegg_cid, sources in hits.items():
+            key = (kegg_cid, inchi_key, "")
+            merged.setdefault(key, set()).update(sources)
+
+    for smiles_norm, hits in indexes.get("by_smiles_norm", {}).items():
+        for kegg_cid, sources in hits.items():
+            matched_key = None
+            for key in merged:
+                if key[0] == kegg_cid and key[2] == smiles_norm:
+                    matched_key = key
+                    break
+            if matched_key is None:
+                matched_key = (kegg_cid, "", smiles_norm)
+            merged.setdefault(matched_key, set()).update(sources)
+
+    for (kegg_cid, inchi_key, smiles_norm), sources in sorted(merged.items()):
+        rows.append(
+            {
+                "kegg_cid": kegg_cid,
+                "inchi_key_full": inchi_key,
+                "smiles_norm": smiles_norm,
+                "source_dbs": ";".join(sorted(sources)),
+                "source_count": len(sources),
+            }
+        )
+    return rows
+
+
+def _build_chebi_to_kegg_bridge_index(
+    compounds: dict[str, ChEBICompound],
+    xrefs: dict[str, XrefInfo],
+) -> dict[str, set[str]]:
+    """Index KEGG IDs by ChEBI accession for PMN bridge lookups."""
+
+    table: defaultdict[str, set[str]] = defaultdict(set)
+    for compound_id, compound in compounds.items():
+        for kegg_id in xrefs.get(compound_id, XrefInfo()).kegg_ids:
+            if KEGG_ID_RE.fullmatch(kegg_id):
+                table[compound.chebi_accession].add(kegg_id)
+    return {chebi_id: set(kegg_ids) for chebi_id, kegg_ids in table.items()}
+
+
+def _build_pubchem_to_kegg_bridge_index(
+    xrefs: dict[str, XrefInfo],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+) -> dict[str, set[str]]:
+    """Index KEGG IDs by PubChem CID for PMN bridge lookups."""
+
+    table: defaultdict[str, set[str]] = defaultdict(set)
+    for info in xrefs.values():
+        valid_kegg_ids = {kegg_id for kegg_id in info.kegg_ids if KEGG_ID_RE.fullmatch(kegg_id)}
+        if not valid_kegg_ids:
+            continue
+        for cid in info.pubchem_cids:
+            table[cid].update(valid_kegg_ids)
+    for record in lipidmaps_records.values():
+        valid_kegg_ids = {kegg_id for kegg_id in record.kegg_ids if KEGG_ID_RE.fullmatch(kegg_id)}
+        if not valid_kegg_ids:
+            continue
+        for cid in record.pubchem_cids:
+            table[cid].update(valid_kegg_ids)
+    return {cid: set(kegg_ids) for cid, kegg_ids in table.items()}
+
+
+def bridge_confidence_label(score: float) -> str:
+    """Bucket PMN->KEGG bridge scores into coarse confidence levels."""
+
+    if score >= 0.93:
+        return "high"
+    if score >= 0.88:
+        return "medium"
+    return "low"
+
+
+def build_plant_to_kegg_bridge(
+    *,
+    compound: ChEBICompound,
+    context: CompoundContext,
+    plantcyc_records: dict[str, PlantCycCompound],
+    chebi_to_kegg_index: dict[str, set[str]],
+    pubchem_to_kegg_index: dict[str, set[str]],
+    kegg_structure_indexes: dict[str, dict[str, dict[str, set[str]]]],
+) -> list[PlantToKeggBridge]:
+    """Bridge matched PMN records back to KEGG using curated and structural evidence."""
+
+    bridges: dict[tuple[str, str], dict[str, object]] = {}
+
+    for record_id, matched_methods in sorted(context.matched_plantcyc_methods.items()):
+        record = plantcyc_records[record_id]
+        arabidopsis_supported = record.source_db == "AraCyc"
+
+        def add_bridge(
+            *,
+            kegg_cid: str,
+            bridge_method: str,
+            supporting_ids: list[str],
+            has_structure_evidence: bool,
+            bridge_reason: str,
+        ) -> None:
+            if not KEGG_ID_RE.fullmatch(kegg_cid):
+                return
+            key = (record.record_id, kegg_cid)
+            base_score = PLANT_BRIDGE_BASE_SCORES[(bridge_method, record.source_db)]
+            extra_sources = 0
+            if bridge_method != "plant_direct_kegg_xref" and record.kegg_ids:
+                extra_sources += 1
+            if bridge_method != "plant_via_chebi" and record.chebi_ids:
+                extra_sources += 1
+            if bridge_method != "plant_via_pubchem" and record.pubchem_cids:
+                extra_sources += 1
+            bridge_score = min(base_score + min(extra_sources, 3) * 0.01, base_score + 0.03)
+            existing = bridges.get(key)
+            if existing and float(existing["bridge_score"]) >= bridge_score:
+                existing["bridge_record_ids"].add(record.record_id)
+                existing["supporting_ids"].update(supporting_ids)
+                existing["bridge_reason"].add(bridge_reason)
+                return
+            bridges[key] = {
+                "compound_id": compound.compound_id,
+                "chebi_accession": compound.chebi_accession,
+                "canonical_name": compound.name,
+                "plant_db": record.source_db,
+                "plant_compound_id": record.compound_id,
+                "kegg_cid": kegg_cid,
+                "bridge_method": bridge_method,
+                "bridge_score": bridge_score,
+                "bridge_record_ids": {record.record_id},
+                "supporting_ids": set(supporting_ids),
+                "arabidopsis_supported": arabidopsis_supported,
+                "has_structure_evidence": has_structure_evidence,
+                "bridge_reason": {bridge_reason},
+            }
+
+        for kegg_cid in sorted(record.kegg_ids):
+            add_bridge(
+                kegg_cid=kegg_cid,
+                bridge_method="plant_direct_kegg_xref",
+                supporting_ids=[f"KEGG:{kegg_cid}"],
+                has_structure_evidence=False,
+                bridge_reason=f"{record.source_db} record {record.compound_id} carries direct KEGG link {kegg_cid}",
+            )
+
+        for chebi_id in sorted(record.chebi_ids):
+            for kegg_cid in sorted(chebi_to_kegg_index.get(chebi_id, set())):
+                add_bridge(
+                    kegg_cid=kegg_cid,
+                    bridge_method="plant_via_chebi",
+                    supporting_ids=[chebi_id],
+                    has_structure_evidence=False,
+                    bridge_reason=f"{record.source_db} record {record.compound_id} bridges to {kegg_cid} via {chebi_id}",
+                )
+
+        record_inchi_key = ""
+        if record.smiles and Chem is not None:
+            try:
+                mol = Chem.MolFromSmiles(record.smiles)
+                if mol is not None:
+                    record_inchi_key = normalize_inchi_key(Chem.MolToInchiKey(mol))
+            except Exception:
+                record_inchi_key = ""
+        if record_inchi_key:
+            for kegg_cid, sources in sorted(kegg_structure_indexes.get("by_inchi_key_full", {}).get(record_inchi_key, {}).items()):
+                add_bridge(
+                    kegg_cid=kegg_cid,
+                    bridge_method="plant_inchikey_exact",
+                    supporting_ids=[f"InChIKey:{record_inchi_key}"],
+                    has_structure_evidence=True,
+                    bridge_reason=f"{record.source_db} record {record.compound_id} exact InChIKey matches {kegg_cid} via {','.join(sorted(sources))}",
+                )
+
+        for cid in sorted(record.pubchem_cids):
+            for kegg_cid in sorted(pubchem_to_kegg_index.get(cid, set())):
+                add_bridge(
+                    kegg_cid=kegg_cid,
+                    bridge_method="plant_via_pubchem",
+                    supporting_ids=[f"PUBCHEM:{cid}"],
+                    has_structure_evidence=False,
+                    bridge_reason=f"{record.source_db} record {record.compound_id} bridges to {kegg_cid} via PUBCHEM:{cid}",
+                )
+
+        smiles_norm = canonicalize_smiles(record.smiles)
+        if smiles_norm:
+            for kegg_cid, sources in sorted(kegg_structure_indexes.get("by_smiles_norm", {}).get(smiles_norm, {}).items()):
+                add_bridge(
+                    kegg_cid=kegg_cid,
+                    bridge_method="plant_smiles_exact",
+                    supporting_ids=[f"SMILES:{smiles_norm}"],
+                    has_structure_evidence=True,
+                    bridge_reason=f"{record.source_db} record {record.compound_id} canonical SMILES matches {kegg_cid} via {','.join(sorted(sources))}",
+                )
+
+    rows: list[PlantToKeggBridge] = []
+    for (_record_id, _kegg_cid), row in sorted(bridges.items(), key=lambda item: (item[0][1], -item[1]["bridge_score"], item[0][0])):
+        rows.append(
+            PlantToKeggBridge(
+                compound_id=row["compound_id"],
+                chebi_accession=row["chebi_accession"],
+                canonical_name=row["canonical_name"],
+                plant_db=row["plant_db"],
+                plant_compound_id=row["plant_compound_id"],
+                kegg_cid=row["kegg_cid"],
+                bridge_method=row["bridge_method"],
+                bridge_score=float(row["bridge_score"]),
+                bridge_confidence=bridge_confidence_label(float(row["bridge_score"])),
+                bridge_record_ids=tuple(sorted(row["bridge_record_ids"])),
+                supporting_ids=tuple(sorted(row["supporting_ids"])),
+                arabidopsis_supported=bool(row["arabidopsis_supported"]),
+                has_structure_evidence=bool(row["has_structure_evidence"]),
+                bridge_reason="; ".join(sorted(row["bridge_reason"])),
+            )
+        )
+    return rows
 
 
 def load_kegg_compounds(
@@ -1444,7 +1788,7 @@ def build_candidate_mappings(
     structure: StructureInfo | None,
     xrefs: XrefInfo,
     context: CompoundContext,
-    plantcyc_records: dict[str, PlantCycCompound],
+    plant_bridge_rows: list[PlantToKeggBridge],
     lipidmaps_records: dict[str, LipidMapsRecord],
     kegg_compounds: dict[str, KeggCompound],
     kegg_standard_indexes: dict[str, defaultdict[str, set[str]]],
@@ -1503,31 +1847,19 @@ def build_candidate_mappings(
                     has_structure_evidence=True,
                 )
 
-    for record_id, methods in context.matched_plantcyc_methods.items():
-        record = plantcyc_records[record_id]
-        if not record.kegg_ids:
+    for bridge in plant_bridge_rows:
+        if bridge.kegg_cid not in kegg_compounds:
             continue
-        for kegg_id in record.kegg_ids:
-            if kegg_id not in kegg_compounds:
-                continue
-            score = 0.89
-            match_label = "name"
-            if "chebi" in methods or "kegg" in methods:
-                score = 0.97 if record.source_db == "AraCyc" else 0.96
-                match_label = "crossref"
-            elif "pubchem" in methods:
-                score = 0.95
-                match_label = "pubchem"
-            elif "name" in methods:
-                score = 0.89
-            if structure and structure.formula_key and record.formula_key and structure.formula_key == record.formula_key:
-                score = min(score + 0.01, 0.98)
-            candidate_for(kegg_id).add_evidence(
-                score=score,
-                method=f"{record.source_db.lower()}_{match_label}",
-                reason=f"{record.source_db} links {compound.chebi_accession} to {kegg_id} via {','.join(sorted(methods))}",
-                external_source=record.source_db,
-            )
+        candidate_for(bridge.kegg_cid).add_evidence(
+            score=bridge.bridge_score,
+            method=bridge.bridge_method,
+            reason=bridge.bridge_reason,
+            external_source=bridge.plant_db,
+            has_structure_evidence=bridge.has_structure_evidence,
+            plant_bridge_method=bridge.bridge_method,
+            plant_bridge_source=bridge.plant_db,
+            arabidopsis_supported=bridge.arabidopsis_supported,
+        )
 
     for record_id, methods in context.matched_lipidmaps_methods.items():
         record = lipidmaps_records[record_id]
@@ -1693,6 +2025,15 @@ def mapping_method_label(mapping: CandidateMapping) -> str:
         return "chebi_kegg_xref"
     if "inchi_key_exact" in mapping.methods:
         return "inchi_key_exact"
+    for method in (
+        "plant_direct_kegg_xref",
+        "plant_via_chebi",
+        "plant_inchikey_exact",
+        "plant_via_pubchem",
+        "plant_smiles_exact",
+    ):
+        if method in mapping.methods:
+            return method
     if mapping.has_structure_evidence and "LIPID MAPS" in mapping.external_sources:
         return "lipidmaps_structure_crossref"
     if mapping.external_sources & {"AraCyc", "PlantCyc"}:
@@ -1748,6 +2089,8 @@ def process_compounds(
     support_contexts: dict[str, StoredSupportContext] = {}
     mapping_status: Counter[str] = Counter()
     alias_rows = 0
+    chebi_to_kegg_index = _build_chebi_to_kegg_bridge_index(compounds, xrefs)
+    pubchem_to_kegg_index = _build_pubchem_to_kegg_bridge_index(xrefs, lipidmaps_records)
 
     with alias_output_path.open("w", newline="", encoding="utf-8") as alias_handle, mapping_summary_path.open(
         "w",
@@ -1849,12 +2192,20 @@ def process_compounds(
                 )
                 alias_rows += 1
 
+            plant_bridge_rows = build_plant_to_kegg_bridge(
+                compound=compound,
+                context=context,
+                plantcyc_records=plantcyc_records,
+                chebi_to_kegg_index=chebi_to_kegg_index,
+                pubchem_to_kegg_index=pubchem_to_kegg_index,
+                kegg_structure_indexes=kegg_structure_indexes,
+            )
             ranked = build_candidate_mappings(
                 compound=compound,
                 structure=structure,
                 xrefs=compound_xrefs,
                 context=context,
-                plantcyc_records=plantcyc_records,
+                plant_bridge_rows=plant_bridge_rows,
                 lipidmaps_records=lipidmaps_records,
                 kegg_compounds=kegg_compounds,
                 kegg_standard_indexes=kegg_standard_indexes,

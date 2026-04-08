@@ -93,6 +93,12 @@ def run(context: PipelineContext) -> PipelineContext:
                 "ath_gene_support": round(0.10 * gene_ratio, 3),
                 "direct_kegg_xref": 0.05 if hit.mapping.direct_kegg_xref else 0.0,
                 "structure_support": 0.05 if hit.mapping.has_structure_evidence else 0.0,
+                "direct_link_bonus": 0.12 if hit.direct_link else 0.0,
+                "substrate_role_bonus": 0.12 if hit.has_substrate_role else 0.0,
+                "product_role_bonus": 0.06 if hit.has_product_role else 0.0,
+                "both_role_bonus": 0.03 if hit.has_both_role else 0.0,
+                "cofactor_penalty": -0.15 if hit.cofactor_like else 0.0,
+                "reaction_support_bonus": round(min(0.12, 0.05 * math.log1p(hit.support_reaction_count)), 3),
                 "plantcyc_support": round(plant_bonus, 3),
                 "generic_pathway_penalty": generic_penalty,
                 "map_fallback_penalty": -0.10 if not hit.ath_pathway_id else 0.0,
@@ -126,6 +132,17 @@ def run(context: PipelineContext) -> PipelineContext:
                 confidence_level=confidence_level,
                 contributions=contributions,
             )
+            role_notes = []
+            if hit.direct_link:
+                role_notes.append("direct KEGG compound-pathway link")
+            if hit.has_substrate_role or hit.has_product_role or hit.has_both_role:
+                role_notes.append(f"reaction roles: {hit.role_summary}")
+            if hit.cofactor_like:
+                role_notes.append("cofactor-like participation lowered the score")
+            if hit.relation_vstamp:
+                role_notes.append(f"relation_vstamp={hit.relation_vstamp}")
+            if role_notes:
+                explanation = f"{explanation}; " + "; ".join(role_notes)
 
             # Aggregate rows by their final target pathway so different KEGG
             # supporting compounds can contribute to the same pathway entry.
@@ -141,11 +158,14 @@ def run(context: PipelineContext) -> PipelineContext:
                     "pathway_target_type": hit.pathway_target_type,
                     "ath_pathway_id": hit.ath_pathway_id,
                     "map_pathway_id": hit.map_pathway_id,
+                    "relation_vstamp": hit.relation_vstamp,
                     "pathway_name": hit.pathway_name,
                     "pathway_group": hit.pathway_group,
                     "pathway_category": hit.pathway_category,
                     "map_pathway_compound_count": hit.map_pathway_compound_count,
                     "ath_gene_count": hit.ath_gene_count,
+                    "support_reaction_count": hit.support_reaction_count,
+                    "role_summary": hit.role_summary,
                     "plantcyc_support_source": plant_source,
                     "plantcyc_support_examples": plant_examples,
                     "reactome_matches": reactome_text,
@@ -164,6 +184,9 @@ def run(context: PipelineContext) -> PipelineContext:
                 entry["confidence_level"] = confidence_level
                 entry["mapping_confidence"] = hit.mapping.final_score
                 entry["ath_gene_count"] = hit.ath_gene_count
+                entry["relation_vstamp"] = hit.relation_vstamp
+                entry["support_reaction_count"] = hit.support_reaction_count
+                entry["role_summary"] = hit.role_summary
                 entry["plantcyc_support_source"] = plant_source
                 entry["plantcyc_support_examples"] = plant_examples
                 entry["reactome_matches"] = reactome_text
@@ -218,11 +241,14 @@ def run(context: PipelineContext) -> PipelineContext:
                     pathway_target_type=str(entry["pathway_target_type"]),
                     ath_pathway_id=str(entry["ath_pathway_id"]),
                     map_pathway_id=str(entry["map_pathway_id"]),
+                    relation_vstamp=str(entry["relation_vstamp"]),
                     pathway_name=str(entry["pathway_name"]),
                     pathway_group=str(entry["pathway_group"]),
                     pathway_category=str(entry["pathway_category"]),
                     map_pathway_compound_count=int(entry["map_pathway_compound_count"]),
                     ath_gene_count=int(entry["ath_gene_count"]),
+                    support_reaction_count=int(entry["support_reaction_count"]),
+                    role_summary=str(entry["role_summary"]),
                     plantcyc_support_source=str(entry["plantcyc_support_source"]),
                     plantcyc_support_examples=str(entry["plantcyc_support_examples"]),
                     reactome_matches=str(entry["reactome_matches"]),

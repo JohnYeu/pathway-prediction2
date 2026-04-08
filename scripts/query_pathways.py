@@ -180,6 +180,10 @@ class MappingRecord:
     best_variant: str
     evidence_count: int
     external_sources: tuple[str, ...]
+    bridge_method: str
+    bridge_confidence: str
+    bridge_source_db: str
+    arabidopsis_supported: bool
     mapping_reason: str
 
 
@@ -204,6 +208,20 @@ class PlantEvidence:
     plant_support_examples: str
     plant_support_bonus: float
     plant_support_gene_count: int
+
+
+@dataclass(slots=True)
+class PathwayRoleEvidence:
+    relation_vstamp: str
+    direct_link: bool
+    support_reaction_count: int
+    support_rids: tuple[str, ...]
+    has_substrate_role: bool
+    has_product_role: bool
+    has_both_role: bool
+    cofactor_like: bool
+    role_summary: str
+    reaction_role_score: float
 
 
 @dataclass(slots=True)
@@ -235,6 +253,9 @@ class RankedPathway:
     confidence_level: str
     support_kegg_compound_ids: tuple[str, ...]
     support_kegg_names: tuple[str, ...]
+    relation_vstamp: str
+    support_reaction_count: int
+    role_summary: str
     reason: str
 
 
@@ -534,6 +555,10 @@ def load_name_to_kegg(path: Path):
                 best_variant=row["best_variant"],
                 evidence_count=int(row["evidence_count"] or 0),
                 external_sources=tuple(value for value in row["external_sources"].split(";") if value),
+                bridge_method=row.get("bridge_method", ""),
+                bridge_confidence=row.get("bridge_confidence", ""),
+                bridge_source_db=row.get("bridge_source_db", ""),
+                arabidopsis_supported=row.get("arabidopsis_supported", "").lower() == "true",
                 mapping_reason=row["mapping_reason"],
             )
             for variant_name, value in (
@@ -591,6 +616,10 @@ def load_structure_to_kegg(path: Path):
                     best_variant=row["best_variant"],
                     evidence_count=int(row["evidence_count"] or 0),
                     external_sources=tuple(value for value in row["external_sources"].split(";") if value),
+                    bridge_method=row.get("bridge_method", ""),
+                    bridge_confidence=row.get("bridge_confidence", ""),
+                    bridge_source_db=row.get("bridge_source_db", ""),
+                    arabidopsis_supported=row.get("arabidopsis_supported", "").lower() == "true",
                     mapping_reason=row["mapping_reason"],
                 )
             )
@@ -600,6 +629,61 @@ def load_structure_to_kegg(path: Path):
             reverse=True,
         )
     return dict(mappings)
+
+
+def load_plant_to_kegg_bridge(path: Path):
+    """Load precomputed PMN -> KEGG bridge candidates keyed by compound_id."""
+
+    mappings = defaultdict(list)
+    if not path.exists():
+        return {}, {}
+    best_mapping_score_by_compound = defaultdict(float)
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            record = MappingRecord(
+                compound_id=row["compound_id"],
+                chebi_accession=row["chebi_accession"],
+                canonical_name=row["canonical_name"],
+                canonical_exact_name=build_variants(row["canonical_name"])["exact"],
+                canonical_compact_name=build_variants(row["canonical_name"])["compact"],
+                canonical_singular_name=build_variants(row["canonical_name"])["singular"],
+                canonical_stereo_stripped_name=build_variants(row["canonical_name"])["stereo_stripped"],
+                kegg_compound_id=row["kegg_cid"],
+                kegg_primary_name=row.get("kegg_primary_name", ""),
+                mapping_score=float(row["bridge_score"]),
+                mapping_confidence_level=row["bridge_confidence"],
+                mapping_method=row["bridge_method"],
+                direct_kegg_xref=row["bridge_method"] == "plant_direct_kegg_xref",
+                has_structure_evidence=row["has_structure_evidence"].lower() == "true",
+                used_pubchem_synonym=False,
+                best_alias="",
+                best_alias_source="",
+                best_variant="",
+                evidence_count=max(1, len([value for value in row["supporting_ids"].split(";") if value])),
+                external_sources=(row["plant_db"],),
+                bridge_method=row["bridge_method"],
+                bridge_confidence=row["bridge_confidence"],
+                bridge_source_db=row["plant_db"],
+                arabidopsis_supported=row["arabidopsis_supported"].lower() == "true",
+                mapping_reason=row["bridge_reason"],
+            )
+            mappings[row["compound_id"]].append(record)
+            best_mapping_score_by_compound[row["compound_id"]] = max(
+                best_mapping_score_by_compound[row["compound_id"]],
+                record.mapping_score,
+            )
+    for compound_id in mappings:
+        mappings[compound_id].sort(
+            key=lambda item: (
+                item.mapping_score,
+                item.arabidopsis_supported,
+                item.has_structure_evidence,
+                item.kegg_compound_id,
+            ),
+            reverse=True,
+        )
+    return dict(mappings), dict(best_mapping_score_by_compound)
 
 
 def load_compound_to_pathway(path: Path):
@@ -613,6 +697,28 @@ def load_compound_to_pathway(path: Path):
     for kegg_compound_id in links:
         links[kegg_compound_id] = sorted(set(links[kegg_compound_id]))
     return dict(links)
+
+
+def load_compound_to_pathway_roles(path: Path):
+    """Load the aggregated step-3 reaction-role evidence."""
+
+    roles = defaultdict(dict)
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            roles[row["kegg_compound_id"]][row["map_pathway_id"]] = PathwayRoleEvidence(
+                relation_vstamp=row["relation_vstamp"],
+                direct_link=row["direct_link"].lower() == "true",
+                support_reaction_count=int(row["support_reaction_count"] or 0),
+                support_rids=tuple(value for value in row["support_rids"].split(";") if value),
+                has_substrate_role=row["has_substrate_role"].lower() == "true",
+                has_product_role=row["has_product_role"].lower() == "true",
+                has_both_role=row["has_both_role"].lower() == "true",
+                cofactor_like=row["cofactor_like"].lower() == "true",
+                role_summary=row["role_summary"],
+                reaction_role_score=float(row["reaction_role_score"] or 0.0),
+            )
+    return {cid: dict(items) for cid, items in roles.items()}
 
 
 def load_map_to_ath(path: Path):
@@ -852,6 +958,7 @@ def rank_pathways(
     resolved: ResolvedName,
     mappings,
     compound_to_pathway,
+    compound_to_pathway_roles,
     map_to_ath,
     pathway_annotations,
     plant_evidence,
@@ -868,6 +975,7 @@ def rank_pathways(
     for mapping in mappings:
         evidence_by_name = plant_evidence.get(mapping.compound_id, {})
         for map_pathway_id in compound_to_pathway.get(mapping.kegg_compound_id, []):
+            role = compound_to_pathway_roles.get(mapping.kegg_compound_id, {}).get(map_pathway_id)
             ath_pathway_id = map_to_ath.get(map_pathway_id, "")
             target_id = ath_pathway_id or map_pathway_id
             annotation = pathway_annotations.get(target_id)
@@ -886,12 +994,20 @@ def rank_pathways(
                 "ath_gene_support": round(0.10 * gene_ratio, 3),
                 "direct_kegg_xref": 0.05 if mapping.direct_kegg_xref else 0.0,
                 "structure_support": 0.05 if mapping.has_structure_evidence else 0.0,
+                "direct_link_bonus": 0.12 if role and role.direct_link else 0.0,
+                "substrate_role_bonus": 0.12 if role and role.has_substrate_role else 0.0,
+                "product_role_bonus": 0.06 if role and role.has_product_role else 0.0,
+                "both_role_bonus": 0.03 if role and role.has_both_role else 0.0,
+                "cofactor_penalty": -0.15 if role and role.cofactor_like else 0.0,
+                "reaction_support_bonus": round(min(0.12, 0.05 * math.log1p(role.support_reaction_count)), 3) if role else 0.0,
                 "plantcyc_support": round(plant_bonus, 3),
                 "generic_pathway_penalty": generic_penalty,
                 "map_fallback_penalty": -0.10 if not annotation.ath_pathway_id else 0.0,
             }
             score = max(0.0, min(sum(contributions.values()), 0.999))
             confidence = "high" if score >= 0.70 and annotation.ath_pathway_id and annotation.ath_gene_count > 0 else "medium" if score >= 0.40 else "low"
+            if role and role.cofactor_like and not (role.has_substrate_role or role.has_product_role or role.has_both_role):
+                confidence = "medium" if confidence == "high" else confidence
             positive_features = [f"{k}={v:.3f}" for k, v in sorted(contributions.items(), key=lambda item: item[1], reverse=True) if v > 0][:3]
             negative_features = [f"{k}={v:.3f}" for k, v in sorted(contributions.items(), key=lambda item: item[1]) if v < 0][:2]
             reason_parts = [
@@ -899,6 +1015,14 @@ def rank_pathways(
                 f"score {score:.3f}",
                 f"mapping {mapping.kegg_compound_id} ({mapping.kegg_primary_name}) via {mapping.mapping_method}",
             ]
+            if role and role.direct_link:
+                reason_parts.append("direct KEGG compound-pathway link")
+            if role and role.role_summary:
+                reason_parts.append(f"reaction roles: {role.role_summary}")
+            if role and role.cofactor_like:
+                reason_parts.append("cofactor-like participation lowered the score")
+            if role and role.relation_vstamp:
+                reason_parts.append(f"relation_vstamp={role.relation_vstamp}")
             if annotation.pathway_target_type == "map_fallback":
                 reason_parts.append("used map fallback because no ath-specific pathway was available")
             if annotation.ath_gene_count:
@@ -920,6 +1044,9 @@ def rank_pathways(
                     "annotation": annotation,
                     "support_ids": set(),
                     "support_names": set(),
+                    "relation_vstamp": role.relation_vstamp if role else "",
+                    "support_reaction_count": role.support_reaction_count if role else 0,
+                    "role_summary": role.role_summary if role else "",
                 },
             )
             if score > float(entry["score"]):
@@ -927,6 +1054,9 @@ def rank_pathways(
                 entry["confidence"] = confidence
                 entry["reason"] = reason
                 entry["annotation"] = annotation
+                entry["relation_vstamp"] = role.relation_vstamp if role else ""
+                entry["support_reaction_count"] = role.support_reaction_count if role else 0
+                entry["role_summary"] = role.role_summary if role else ""
             entry["support_ids"].add(mapping.kegg_compound_id)
             entry["support_names"].add(mapping.kegg_primary_name)
 
@@ -954,6 +1084,9 @@ def rank_pathways(
                 confidence_level=str(entry["confidence"]),
                 support_kegg_compound_ids=tuple(sorted(entry["support_ids"])),
                 support_kegg_names=tuple(sorted(entry["support_names"])),
+                relation_vstamp=str(entry["relation_vstamp"]),
+                support_reaction_count=int(entry["support_reaction_count"]),
+                role_summary=str(entry["role_summary"]),
                 reason=str(entry["reason"]),
             )
         )
@@ -987,7 +1120,7 @@ def rank_pmn_fallback_pathways(
         dense_gene_bonus = 0.05 if plant.plant_support_gene_count >= 3 else 0.0
         source_bonus = 0.07 if plant.plant_support_source == "AraCyc" else 0.05
         score = min(0.999, 0.45 + plant.plant_support_bonus + gene_bonus + dense_gene_bonus + source_bonus)
-        confidence = "high" if plant.plant_support_source == "AraCyc" and plant.plant_support_gene_count > 0 else "medium" if plant.plant_support_gene_count > 0 else "low"
+        confidence = "medium" if plant.plant_support_gene_count > 0 or plant.plant_support_source == "AraCyc" else "low"
 
         reason_parts = [
             "direct PMN fallback",
@@ -995,7 +1128,7 @@ def rank_pmn_fallback_pathways(
             f"{plant.plant_support_source} compound-pathway support",
         ]
         if not had_kegg_mapping:
-            reason_parts.append("used because no KEGG compound mapping was available")
+            reason_parts.append("used PMN fallback because PlantCyc/AraCyc candidate had no KEGG bridge")
         else:
             reason_parts.append("used because no KEGG pathway links were available")
         if plant.plant_pathway_ids:
@@ -1015,6 +1148,9 @@ def rank_pmn_fallback_pathways(
                 confidence_level=confidence,
                 support_kegg_compound_ids=(),
                 support_kegg_names=(),
+                relation_vstamp="",
+                support_reaction_count=0,
+                role_summary="",
                 reason="; ".join(reason_parts),
             )
         )
@@ -1037,6 +1173,9 @@ def rank_pmn_fallback_pathways(
             confidence_level=item.confidence_level,
             support_kegg_compound_ids=item.support_kegg_compound_ids,
             support_kegg_names=item.support_kegg_names,
+            relation_vstamp=item.relation_vstamp,
+            support_reaction_count=item.support_reaction_count,
+            role_summary=item.role_summary,
             reason=item.reason,
         )
         for index, item in enumerate(ranked[:top_k], start=1)
@@ -1075,6 +1214,12 @@ def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[Ra
             f"{pathway.pathway_rank}. {pathway.pathway_name} [{pathway.pathway_target_id}] "
             f"score={pathway.score:.3f} confidence={pathway.confidence_level}"
         )
+        if pathway.relation_vstamp:
+            print(f"   relation_vstamp: {pathway.relation_vstamp}")
+        if pathway.support_reaction_count:
+            print(f"   support_reactions: {pathway.support_reaction_count}")
+        if pathway.role_summary:
+            print(f"   role_summary: {pathway.role_summary}")
         if pathway.pathway_target_type == "pmn_direct":
             print("   source: direct AraCyc/PlantCyc (PMN) fallback")
         print(f"   reason: {pathway.reason}")
@@ -1089,7 +1234,9 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         "name_to_formula_index": data_dir / "name_to_formula_index.tsv",
         "name_to_kegg_index": data_dir / "name_to_kegg_index.tsv",
         "compound_structure_kegg_index": data_dir / "compound_structure_kegg_index.tsv",
+        "plant_to_kegg_bridge": data_dir / "plant_to_kegg_bridge.tsv",
         "compound_to_pathway_index": data_dir / "compound_to_pathway_index.tsv",
+        "compound_to_pathway_role_index": data_dir / "compound_to_pathway_role_index.tsv",
         "map_to_ath_index": data_dir / "map_to_ath_index.tsv",
         "pathway_annotation_index": data_dir / "pathway_annotation_index.tsv",
         "plant_evidence_index": data_dir / "plant_evidence_index.tsv",
@@ -1113,8 +1260,16 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         print("- structure-to-KEGG index", flush=True)
     structure_mappings_by_compound = load_structure_to_kegg(paths["compound_structure_kegg_index"])
     if verbose:
+        print("- PMN-to-KEGG bridge index", flush=True)
+    bridge_mappings_by_compound, best_bridge_score_by_compound = load_plant_to_kegg_bridge(paths["plant_to_kegg_bridge"])
+    for compound_id, score in best_bridge_score_by_compound.items():
+        best_mapping_score_by_compound[compound_id] = max(best_mapping_score_by_compound.get(compound_id, 0.0), score)
+    if verbose:
         print("- KEGG compound-to-pathway index", flush=True)
     compound_to_pathway = load_compound_to_pathway(paths["compound_to_pathway_index"])
+    if verbose:
+        print("- KEGG compound-to-pathway role index", flush=True)
+    compound_to_pathway_roles = load_compound_to_pathway_roles(paths["compound_to_pathway_role_index"])
     if verbose:
         print("- map-to-ath index", flush=True)
     map_to_ath = load_map_to_ath(paths["map_to_ath_index"])
@@ -1134,8 +1289,10 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         "verbose": verbose,
         "mappings_by_name": mappings_by_name,
         "structure_mappings_by_compound": structure_mappings_by_compound,
+        "bridge_mappings_by_compound": bridge_mappings_by_compound,
         "best_mapping_score_by_compound": best_mapping_score_by_compound,
         "compound_to_pathway": compound_to_pathway,
+        "compound_to_pathway_roles": compound_to_pathway_roles,
         "map_to_ath": map_to_ath,
         "pathway_annotations": pathway_annotations,
         "plant_evidence": plant_evidence,
@@ -1167,18 +1324,51 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
     if resolved is None:
         return None, [], []
     name_mappings = lookup_mappings_for_standard_name(resolved.canonical_name, state["mappings_by_name"])
+    same_compound_name_mappings = [mapping for mapping in name_mappings if mapping.compound_id == resolved.compound_id]
+    if same_compound_name_mappings:
+        name_mappings = same_compound_name_mappings
     structure_mappings = state["structure_mappings_by_compound"].get(resolved.compound_id, [])
+    bridge_mappings = state["bridge_mappings_by_compound"].get(resolved.compound_id, [])
     direct_name_mappings = [mapping for mapping in name_mappings if mapping.direct_kegg_xref]
     if direct_name_mappings:
         mappings = direct_name_mappings
     elif structure_mappings:
         mappings = structure_mappings
+    elif bridge_mappings:
+        mappings = bridge_mappings
     else:
         mappings = name_mappings
+    deduped_mappings = {}
+    for mapping in mappings:
+        existing = deduped_mappings.get(mapping.kegg_compound_id)
+        if existing is None or (
+            mapping.mapping_score,
+            mapping.direct_kegg_xref,
+            mapping.has_structure_evidence,
+            mapping.arabidopsis_supported,
+        ) > (
+            existing.mapping_score,
+            existing.direct_kegg_xref,
+            existing.has_structure_evidence,
+            existing.arabidopsis_supported,
+        ):
+            deduped_mappings[mapping.kegg_compound_id] = mapping
+    mappings = sorted(
+        deduped_mappings.values(),
+        key=lambda item: (
+            item.mapping_score,
+            item.direct_kegg_xref,
+            item.has_structure_evidence,
+            item.arabidopsis_supported,
+            item.kegg_compound_id,
+        ),
+        reverse=True,
+    )
     pathways = rank_pathways(
         resolved,
         mappings,
         state["compound_to_pathway"],
+        state["compound_to_pathway_roles"],
         state["map_to_ath"],
         state["pathway_annotations"],
         state["plant_evidence"],

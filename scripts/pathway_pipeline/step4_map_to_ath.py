@@ -10,6 +10,7 @@ adds the plant-specific rule from the design table:
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -23,6 +24,26 @@ from pathway_pipeline.context import PipelineContext, Step4ResolvedPathwayHit
 from pathway_pipeline.step1_alias_standardization import run as run_step1
 from pathway_pipeline.step2_map_names_to_kegg import run as run_step2
 from pathway_pipeline.step3_link_compounds_to_pathways import run as run_step3
+
+
+def write_map_to_ath_index(context: PipelineContext) -> int:
+    """Write the KEGG map -> ath conversion index consumed by query step 4."""
+
+    with context.paths.map_to_ath_index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["map_pathway_id", "ath_pathway_id"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for map_pathway_id in sorted(context.map_to_ath):
+            writer.writerow(
+                {
+                    "map_pathway_id": map_pathway_id,
+                    "ath_pathway_id": context.map_to_ath[map_pathway_id],
+                }
+            )
+    return len(context.map_to_ath)
 
 
 def run(context: PipelineContext) -> PipelineContext:
@@ -57,12 +78,23 @@ def run(context: PipelineContext) -> PipelineContext:
                     ath_pathway_id=ath_pathway_id,
                     pathway_target_id=pathway_target_id,
                     pathway_target_type=pathway_target_type,
+                    relation_vstamp=hit.relation_vstamp,
+                    direct_link=hit.direct_link,
+                    support_reaction_count=hit.support_reaction_count,
+                    support_rids=hit.support_rids,
+                    has_substrate_role=hit.has_substrate_role,
+                    has_product_role=hit.has_product_role,
+                    has_both_role=hit.has_both_role,
+                    cofactor_like=hit.cofactor_like,
+                    role_summary=hit.role_summary,
+                    reaction_role_score=hit.reaction_role_score,
                 )
             )
         resolved_hits[compound_id] = resolved
 
     # Persist the resolved view for annotation.
     context.resolved_pathway_hits = resolved_hits
+    context.preprocess_counts["map_to_ath_index"] = write_map_to_ath_index(context)
     return context
 
 
@@ -92,6 +124,7 @@ def main() -> None:
             f"Resolved ath pathway hits: {ath_count}",
             f"Map fallback hits: {fallback_count}",
             f"ath pathway reference table: {context.paths.kegg_pathway_ath_path}",
+            f"Map-to-ath index: {context.paths.map_to_ath_index_path}",
         ],
     )
 

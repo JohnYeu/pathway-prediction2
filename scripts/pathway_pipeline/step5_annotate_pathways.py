@@ -13,6 +13,7 @@ human-readable output and scoring:
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -34,6 +35,139 @@ from pathway_pipeline.step1_alias_standardization import run as run_step1
 from pathway_pipeline.step2_map_names_to_kegg import run as run_step2
 from pathway_pipeline.step3_link_compounds_to_pathways import run as run_step3
 from pathway_pipeline.step4_map_to_ath import run as run_step4
+
+
+def write_pathway_annotation_index(context: PipelineContext) -> int:
+    """Write a unified map/ath annotation table consumed by query step 5."""
+
+    row_count = 0
+    map_ids = sorted(set(context.map_pathways) | set(context.map_to_ath))
+    with context.paths.pathway_annotation_index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "pathway_id",
+                "pathway_target_type",
+                "map_pathway_id",
+                "ath_pathway_id",
+                "pathway_name",
+                "pathway_group",
+                "pathway_category",
+                "map_pathway_compound_count",
+                "ath_gene_count",
+                "reactome_matches",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for map_pathway_id in map_ids:
+            group, category, _unused = context.pathway_categories.get(map_pathway_id, ("", "", ""))
+            map_name = context.map_pathways.get(map_pathway_id, map_pathway_id)
+            writer.writerow(
+                {
+                    "pathway_id": map_pathway_id,
+                    "pathway_target_type": "map_fallback",
+                    "map_pathway_id": map_pathway_id,
+                    "ath_pathway_id": "",
+                    "pathway_name": map_name,
+                    "pathway_group": group,
+                    "pathway_category": category,
+                    "map_pathway_compound_count": context.map_pathway_compound_counts.get(map_pathway_id, 0),
+                    "ath_gene_count": 0,
+                    "reactome_matches": ";".join(
+                        f"{pathway_id}|{species}"
+                        for pathway_id, species in context.reactome_pathways.get(normalize_name(map_name), [])[:3]
+                    ),
+                }
+            )
+            row_count += 1
+
+            ath_pathway_id = context.map_to_ath.get(map_pathway_id, "")
+            if not ath_pathway_id:
+                continue
+            ath_name = context.ath_pathways.get(ath_pathway_id, ath_pathway_id)
+            writer.writerow(
+                {
+                    "pathway_id": ath_pathway_id,
+                    "pathway_target_type": "ath",
+                    "map_pathway_id": map_pathway_id,
+                    "ath_pathway_id": ath_pathway_id,
+                    "pathway_name": ath_name,
+                    "pathway_group": group,
+                    "pathway_category": category,
+                    "map_pathway_compound_count": context.map_pathway_compound_counts.get(map_pathway_id, 0),
+                    "ath_gene_count": context.ath_gene_counts.get(ath_pathway_id, 0),
+                    "reactome_matches": ";".join(
+                        f"{pathway_id}|{species}"
+                        for pathway_id, species in context.reactome_pathways.get(normalize_name(ath_name), [])[:3]
+                    ),
+                }
+            )
+            row_count += 1
+    return row_count
+
+
+def write_plant_evidence_index(context: PipelineContext) -> int:
+    """Write PMN support used for KEGG boosting and direct PMN fallback."""
+
+    row_count = 0
+    with context.paths.plant_evidence_index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "canonical_name",
+                "pathway_name_normalized",
+                "plant_support_source",
+                "plant_pathway_ids",
+                "plant_support_examples",
+                "plant_support_bonus",
+                "plant_support_gene_count",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for compound_id in sorted(context.compounds, key=int):
+            compound = context.compounds[compound_id]
+            compound_context = context.compound_contexts[compound_id]
+
+            for normalized_name, names in sorted(compound_context.aracyc_pathways.items()):
+                pathway_stat = context.plantcyc_pathway_stats["AraCyc"].get(normalized_name, {})
+                gene_count = len(pathway_stat.get("gene_ids", set()))
+                writer.writerow(
+                    {
+                        "compound_id": compound_id,
+                        "chebi_accession": compound.chebi_accession,
+                        "canonical_name": compound.name,
+                        "pathway_name_normalized": normalized_name,
+                        "plant_support_source": "AraCyc",
+                        "plant_pathway_ids": ";".join(sorted(pathway_stat.get("pathway_ids", set()))),
+                        "plant_support_examples": ";".join(sorted(names)[:3]),
+                        "plant_support_bonus": "0.060",
+                        "plant_support_gene_count": gene_count,
+                    }
+                )
+                row_count += 1
+
+            for normalized_name, names in sorted(compound_context.plantcyc_pathways.items()):
+                pathway_stat = context.plantcyc_pathway_stats["PlantCyc"].get(normalized_name, {})
+                gene_count = len(pathway_stat.get("gene_ids", set()))
+                writer.writerow(
+                    {
+                        "compound_id": compound_id,
+                        "chebi_accession": compound.chebi_accession,
+                        "canonical_name": compound.name,
+                        "pathway_name_normalized": normalized_name,
+                        "plant_support_source": "PlantCyc",
+                        "plant_pathway_ids": ";".join(sorted(pathway_stat.get("pathway_ids", set()))),
+                        "plant_support_examples": ";".join(sorted(names)[:3]),
+                        "plant_support_bonus": "0.040",
+                        "plant_support_gene_count": gene_count,
+                    }
+                )
+                row_count += 1
+    return row_count
 
 
 def run(context: PipelineContext) -> PipelineContext:
@@ -90,12 +224,24 @@ def run(context: PipelineContext) -> PipelineContext:
                     map_pathway_compound_count=context.map_pathway_compound_counts.get(hit.map_pathway_id, 0),
                     ath_gene_count=context.ath_gene_counts.get(hit.ath_pathway_id, 0) if hit.ath_pathway_id else 0,
                     reactome_matches=reactome_matches,
+                    relation_vstamp=hit.relation_vstamp,
+                    direct_link=hit.direct_link,
+                    support_reaction_count=hit.support_reaction_count,
+                    support_rids=hit.support_rids,
+                    has_substrate_role=hit.has_substrate_role,
+                    has_product_role=hit.has_product_role,
+                    has_both_role=hit.has_both_role,
+                    cofactor_like=hit.cofactor_like,
+                    role_summary=hit.role_summary,
+                    reaction_role_score=hit.reaction_role_score,
                 )
             )
         annotated_hits[compound_id] = annotated
 
     # Persist the metadata-enriched pathway hits for step 6 scoring.
     context.annotated_pathway_hits = annotated_hits
+    context.preprocess_counts["pathway_annotation_index"] = write_pathway_annotation_index(context)
+    context.preprocess_counts["plant_evidence_index"] = write_plant_evidence_index(context)
     return context
 
 
@@ -123,6 +269,8 @@ def main() -> None:
         "Step 5 completed.",
         [
             f"Annotated pathway hits: {annotated_count}",
+            f"Pathway annotation index: {context.paths.pathway_annotation_index_path}",
+            f"Plant evidence index: {context.paths.plant_evidence_index_path}",
             f"Pathway category table: {context.paths.kegg_pathway_hierarchy_path}",
             f"Reactome context table: {context.paths.reactome_pathways_path}",
         ],

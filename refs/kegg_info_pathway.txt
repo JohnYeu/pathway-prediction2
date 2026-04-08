@@ -1,0 +1,18 @@
+pathway          KEGG Pathway Database
+path             Release 118.0+/04-08, Apr 26
+                 Kanehisa Laboratories
+                 585 entries
+
+linked db        module
+                 ko
+                 <org>
+                 genome
+                 compound
+                 glycan
+                 reaction
+                 rclass
+                 enzyme
+                 network
+                 disease
+                 drug
+                 pubmed

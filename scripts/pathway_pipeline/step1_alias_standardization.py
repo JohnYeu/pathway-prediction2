@@ -28,6 +28,7 @@ from process_chebi_to_pathways_v2 import (
     XrefInfo,
     build_compound_context,
     build_name_formula_index,
+    build_variants,
     load_base_aliases,
     load_comments_profile,
     load_compounds,
@@ -41,6 +42,151 @@ from process_chebi_to_pathways_v2 import (
 
 from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
 from pathway_pipeline.context import PipelineContext
+
+
+def _inchi_key_prefix(value: str) -> str:
+    """Return the connectivity block of an InChIKey when available."""
+
+    text = (value or "").strip().upper()
+    if not text:
+        return ""
+    return text.split("-", 1)[0]
+
+
+def write_name_normalization_index(context: PipelineContext) -> int:
+    """Write the canonical name + alias table consumed by query step 1."""
+
+    row_count = 0
+    with context.paths.name_normalization_index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "canonical_name",
+                "alias",
+                "source_type",
+                "is_primary_name",
+                "exact_name",
+                "compact_name",
+                "singular_name",
+                "stereo_stripped_name",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for compound_id in sorted(context.compounds, key=int):
+            compound = context.compounds[compound_id]
+            compound_context = context.compound_contexts[compound_id]
+            for alias in sorted(compound_context.all_aliases, key=lambda item: (item.source_type, item.raw_name)):
+                writer.writerow(
+                    {
+                        "compound_id": compound_id,
+                        "chebi_accession": compound.chebi_accession,
+                        "canonical_name": compound.name,
+                        "alias": alias.raw_name,
+                        "source_type": alias.source_type,
+                        "is_primary_name": str(alias.source_type == "compound_name").lower(),
+                        "exact_name": alias.exact,
+                        "compact_name": alias.compact,
+                        "singular_name": alias.singular,
+                        "stereo_stripped_name": alias.stereo_stripped,
+                    }
+                )
+                row_count += 1
+    return row_count
+
+
+def aggregate_name_formula_rows(context: PipelineContext) -> dict[tuple[str, str], dict[str, object]]:
+    """Aggregate normalized names to structure signatures for weak-match validation."""
+
+    rows: dict[tuple[str, str], dict[str, object]] = {}
+
+    def add_name(name: str, formula_key_value: str, inchi_key_value: str, source: str) -> None:
+        if not name:
+            return
+        variants = build_variants(name)
+        key = (variants["exact"], variants["compact"])
+        if not key[0] or not key[1]:
+            return
+        entry = rows.setdefault(
+            key,
+            {
+                "exact_name": key[0],
+                "compact_name": key[1],
+                "formula_keys": set(),
+                "inchi_key_prefixes": set(),
+                "inchi_key_fulls": set(),
+                "evidence_sources": set(),
+            },
+        )
+        if formula_key_value:
+            entry["formula_keys"].add(formula_key_value)
+        normalized_inchi = (inchi_key_value or "").strip().upper()
+        if normalized_inchi:
+            entry["inchi_key_fulls"].add(normalized_inchi)
+            prefix = _inchi_key_prefix(normalized_inchi)
+            if prefix:
+                entry["inchi_key_prefixes"].add(prefix)
+        entry["evidence_sources"].add(source)
+
+    for compound_id, aliases in context.base_aliases.items():
+        structure = context.structures.get(compound_id)
+        if not structure:
+            continue
+        for alias in aliases:
+            add_name(alias.raw_name, structure.formula_key, structure.standard_inchi_key, "ChEBI")
+
+    for record in context.plantcyc_records.values():
+        add_name(record.common_name, record.formula_key, "", record.source_db)
+        for synonym in sorted(record.synonyms):
+            add_name(synonym, record.formula_key, "", record.source_db)
+
+    for record in context.lipidmaps_records.values():
+        add_name(record.common_name, record.formula_key, record.inchi_key, "LIPID MAPS")
+        add_name(record.systematic_name, record.formula_key, record.inchi_key, "LIPID MAPS")
+        for synonym in sorted(record.synonyms):
+            add_name(synonym, record.formula_key, record.inchi_key, "LIPID MAPS")
+
+    return rows
+
+
+def write_name_to_formula_index(context: PipelineContext, rows: dict[tuple[str, str], dict[str, object]]) -> int:
+    """Write the step-1 structure lookup used by weak query-time corrections."""
+
+    with context.paths.name_to_formula_index_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "exact_name",
+                "compact_name",
+                "formula_keys",
+                "formula_count",
+                "inchi_key_prefixes",
+                "inchi_key_prefix_count",
+                "inchi_key_fulls",
+                "inchi_key_full_count",
+                "evidence_sources",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for key in sorted(rows):
+            entry = rows[key]
+            writer.writerow(
+                {
+                    "exact_name": entry["exact_name"],
+                    "compact_name": entry["compact_name"],
+                    "formula_keys": ";".join(sorted(entry["formula_keys"])),
+                    "formula_count": len(entry["formula_keys"]),
+                    "inchi_key_prefixes": ";".join(sorted(entry["inchi_key_prefixes"])),
+                    "inchi_key_prefix_count": len(entry["inchi_key_prefixes"]),
+                    "inchi_key_fulls": ";".join(sorted(entry["inchi_key_fulls"])),
+                    "inchi_key_full_count": len(entry["inchi_key_fulls"]),
+                    "evidence_sources": ";".join(sorted(entry["evidence_sources"])),
+                }
+            )
+    return len(rows)
 
 
 def run(context: PipelineContext) -> PipelineContext:
@@ -192,6 +338,12 @@ def run(context: PipelineContext) -> PipelineContext:
     # steps and for the final JSON summary.
     context.compound_contexts = compound_contexts
     context.alias_rows = alias_rows
+    context.preprocess_counts["compounds_total"] = len(context.compounds)
+    context.preprocess_counts["comments_profile_keys"] = len(context.comments_profile)
+    context.preprocess_counts["name_normalization_index"] = write_name_normalization_index(context)
+    formula_rows = aggregate_name_formula_rows(context)
+    context.preprocess_counts["name_to_formula_index"] = write_name_to_formula_index(context, formula_rows)
+    context.preprocess_counts["pubchem_target_cids"] = context.pubchem_stats.get("target_cids", 0)
     context.add_note("Step 1 wrote the standardized alias table before KEGG mapping.")
     return context
 
@@ -215,6 +367,8 @@ def main() -> None:
         "Step 1 completed.",
         [
             f"Alias table: {context.paths.alias_output_path}",
+            f"Name normalization index: {context.paths.name_normalization_index_path}",
+            f"Name-to-formula index: {context.paths.name_to_formula_index_path}",
             f"Compounds loaded: {len(context.compounds)}",
             f"Alias rows written: {context.alias_rows}",
             f"PubChem synonym CIDs loaded: {context.pubchem_stats.get('target_cids', 0)}",
