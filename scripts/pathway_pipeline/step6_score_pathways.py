@@ -102,6 +102,8 @@ def run(context: PipelineContext) -> PipelineContext:
                 "plantcyc_support": round(plant_bonus, 3),
                 "generic_pathway_penalty": generic_penalty,
                 "map_fallback_penalty": -0.10 if not hit.ath_pathway_id else 0.0,
+                "annotation_quality_bonus": 0.03 if hit.annotation_confidence == "high" else 0.01 if hit.annotation_confidence == "medium" else 0.0,
+                "plant_reactome_alignment_bonus": 0.02 if hit.plant_reactome_alignment_confidence == "high" else 0.01 if hit.plant_reactome_alignment_confidence == "medium" else 0.0,
             }
 
             # Clamp the final score to a bounded interval so downstream
@@ -143,6 +145,22 @@ def run(context: PipelineContext) -> PipelineContext:
                 role_notes.append(f"relation_vstamp={hit.relation_vstamp}")
             if role_notes:
                 explanation = f"{explanation}; " + "; ".join(role_notes)
+            annotation_notes = []
+            if hit.brite_l1 or hit.brite_l2 or hit.brite_l3:
+                annotation_notes.append(
+                    "brite=" + " / ".join(value for value in (hit.brite_l1, hit.brite_l2, hit.brite_l3) if value)
+                )
+            if hit.go_best_term:
+                annotation_notes.append(f"go_best_term={hit.go_best_term}")
+            if hit.plant_context_tags:
+                annotation_notes.append(f"plant_tags={','.join(hit.plant_context_tags)}")
+            if hit.plant_reactome_best_category:
+                note = f"plant_reactome={hit.plant_reactome_best_category}"
+                if hit.plant_reactome_alignment_confidence:
+                    note += f" ({hit.plant_reactome_alignment_confidence})"
+                annotation_notes.append(note)
+            if annotation_notes:
+                explanation = f"{explanation}; " + "; ".join(annotation_notes)
 
             # Aggregate rows by their final target pathway so different KEGG
             # supporting compounds can contribute to the same pathway entry.
@@ -160,10 +178,21 @@ def run(context: PipelineContext) -> PipelineContext:
                     "map_pathway_id": hit.map_pathway_id,
                     "relation_vstamp": hit.relation_vstamp,
                     "pathway_name": hit.pathway_name,
+                    "map_id": hit.map_id,
+                    "kegg_name": hit.kegg_name,
+                    "brite_l1": hit.brite_l1,
+                    "brite_l2": hit.brite_l2,
+                    "brite_l3": hit.brite_l3,
                     "pathway_group": hit.pathway_group,
                     "pathway_category": hit.pathway_category,
                     "map_pathway_compound_count": hit.map_pathway_compound_count,
                     "ath_gene_count": hit.ath_gene_count,
+                    "go_best_term": hit.go_best_term,
+                    "go_best_fdr": hit.go_best_fdr,
+                    "plant_context_tags": ";".join(hit.plant_context_tags),
+                    "plant_reactome_best_category": hit.plant_reactome_best_category,
+                    "plant_reactome_alignment_confidence": hit.plant_reactome_alignment_confidence,
+                    "annotation_confidence": hit.annotation_confidence,
                     "support_reaction_count": hit.support_reaction_count,
                     "role_summary": hit.role_summary,
                     "plantcyc_support_source": plant_source,
@@ -185,6 +214,17 @@ def run(context: PipelineContext) -> PipelineContext:
                 entry["mapping_confidence"] = hit.mapping.final_score
                 entry["ath_gene_count"] = hit.ath_gene_count
                 entry["relation_vstamp"] = hit.relation_vstamp
+                entry["map_id"] = hit.map_id
+                entry["kegg_name"] = hit.kegg_name
+                entry["brite_l1"] = hit.brite_l1
+                entry["brite_l2"] = hit.brite_l2
+                entry["brite_l3"] = hit.brite_l3
+                entry["go_best_term"] = hit.go_best_term
+                entry["go_best_fdr"] = hit.go_best_fdr
+                entry["plant_context_tags"] = ";".join(hit.plant_context_tags)
+                entry["plant_reactome_best_category"] = hit.plant_reactome_best_category
+                entry["plant_reactome_alignment_confidence"] = hit.plant_reactome_alignment_confidence
+                entry["annotation_confidence"] = hit.annotation_confidence
                 entry["support_reaction_count"] = hit.support_reaction_count
                 entry["role_summary"] = hit.role_summary
                 entry["plantcyc_support_source"] = plant_source
@@ -243,10 +283,21 @@ def run(context: PipelineContext) -> PipelineContext:
                     map_pathway_id=str(entry["map_pathway_id"]),
                     relation_vstamp=str(entry["relation_vstamp"]),
                     pathway_name=str(entry["pathway_name"]),
+                    map_id=str(entry["map_id"]),
+                    kegg_name=str(entry["kegg_name"]),
+                    brite_l1=str(entry["brite_l1"]),
+                    brite_l2=str(entry["brite_l2"]),
+                    brite_l3=str(entry["brite_l3"]),
                     pathway_group=str(entry["pathway_group"]),
                     pathway_category=str(entry["pathway_category"]),
                     map_pathway_compound_count=int(entry["map_pathway_compound_count"]),
                     ath_gene_count=int(entry["ath_gene_count"]),
+                    go_best_term=str(entry["go_best_term"]),
+                    go_best_fdr=float(entry["go_best_fdr"]),
+                    plant_context_tags=str(entry["plant_context_tags"]),
+                    plant_reactome_best_category=str(entry["plant_reactome_best_category"]),
+                    plant_reactome_alignment_confidence=str(entry["plant_reactome_alignment_confidence"]),
+                    annotation_confidence=str(entry["annotation_confidence"]),
                     support_reaction_count=int(entry["support_reaction_count"]),
                     role_summary=str(entry["role_summary"]),
                     plantcyc_support_source=str(entry["plantcyc_support_source"]),

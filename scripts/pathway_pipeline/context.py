@@ -74,11 +74,34 @@ class Step5AnnotatedPathwayHit:
     pathway_target_id: str
     pathway_target_type: str
     pathway_name: str
+    map_id: str
+    kegg_name: str
+    brite_l1: str
+    brite_l2: str
+    brite_l3: str
+    kegg_vstamp: str
     pathway_group: str
     pathway_category: str
     map_pathway_compound_count: int
     ath_gene_count: int
+    go_top_terms_json: str
+    go_best_term: str
+    go_best_fdr: float
+    go_vstamp: str
+    plant_context_tags: tuple[str, ...]
+    plant_evidence_sources: tuple[str, ...]
+    aracyc_evidence_score: float
     reactome_matches: tuple[tuple[str, str], ...]
+    plant_reactome_matches_json: str
+    plant_reactome_best_id: str
+    plant_reactome_best_name: str
+    plant_reactome_best_category: str
+    plant_reactome_best_description: str
+    plant_reactome_alignment_score: float
+    plant_reactome_alignment_confidence: str
+    plant_reactome_tags: tuple[str, ...]
+    plant_reactome_vstamp: str
+    annotation_confidence: str
     relation_vstamp: str
     direct_link: bool
     support_reaction_count: int
@@ -111,10 +134,21 @@ class RankedPathwayRow:
     map_pathway_id: str
     relation_vstamp: str
     pathway_name: str
+    map_id: str
+    kegg_name: str
+    brite_l1: str
+    brite_l2: str
+    brite_l3: str
     pathway_group: str
     pathway_category: str
     map_pathway_compound_count: int
     ath_gene_count: int
+    go_best_term: str
+    go_best_fdr: float
+    plant_context_tags: str
+    plant_reactome_best_category: str
+    plant_reactome_alignment_confidence: str
+    annotation_confidence: str
     support_reaction_count: int
     role_summary: str
     plantcyc_support_source: str
@@ -151,6 +185,8 @@ class PipelinePaths:
     kegg_pathway_map_path: Path
     kegg_pathway_hierarchy_path: Path
     kegg_ath_gene_pathway_path: Path
+    go_basic_obo_path: Path
+    gene_association_tair_path: Path
     pubchem_synonyms_path: Path
     lipidmaps_sdf_path: Path
     aracyc_compounds_path: Path
@@ -158,6 +194,9 @@ class PipelinePaths:
     plantcyc_compounds_path: Path
     plantcyc_pathways_path: Path
     reactome_pathways_path: Path
+    plant_reactome_pathways_path: Path
+    plant_reactome_gene_pathway_path: Path
+    plant_reactome_version_path: Path
     preprocessed_dir: Path
     alias_output_path: Path
     mapping_summary_path: Path
@@ -179,6 +218,11 @@ class PipelinePaths:
     compound_to_pathway_index_path: Path
     map_to_ath_index_path: Path
     pathway_annotation_index_path: Path
+    pathway_go_enrichment_index_path: Path
+    gene_to_go_index_path: Path
+    plant_reactome_pathway_index_path: Path
+    plant_reactome_gene_index_path: Path
+    plant_reactome_alignment_path: Path
     plant_evidence_index_path: Path
     preprocess_metadata_path: Path
     preprocessed_history_dir: Path
@@ -218,6 +262,8 @@ class PipelinePaths:
             kegg_pathway_map_path=refs / "kegg_pathway_map.tsv",
             kegg_pathway_hierarchy_path=refs / "kegg_pathway_hierarchy.txt",
             kegg_ath_gene_pathway_path=refs / "kegg_ath_gene_pathway.tsv",
+            go_basic_obo_path=refs / "go-basic.obo",
+            gene_association_tair_path=refs / "gene_association.tair.gz",
             pubchem_synonyms_path=refs / "pubchem_cid_synonym_filtered.gz",
             lipidmaps_sdf_path=refs / "lmsd_extended.sdf.zip",
             aracyc_compounds_path=refs / "aracyc_compounds.20230103",
@@ -225,6 +271,9 @@ class PipelinePaths:
             plantcyc_compounds_path=refs / "plantcyc_compounds.20220103",
             plantcyc_pathways_path=refs / "plantcyc_pathways.20230103",
             reactome_pathways_path=refs / "ReactomePathways.txt",
+            plant_reactome_pathways_path=refs / "plant_reactome_pathways.tsv",
+            plant_reactome_gene_pathway_path=refs / "plant_reactome_gene_pathway.tsv",
+            plant_reactome_version_path=refs / "plant_reactome_version.txt",
             preprocessed_dir=preprocessed_dir,
             alias_output_path=outputs / f"chebi_aliases_standardized{suffix}.tsv",
             mapping_summary_path=outputs / f"chebi_kegg_mapping{suffix}.tsv",
@@ -246,6 +295,11 @@ class PipelinePaths:
             compound_to_pathway_index_path=preprocessed_dir / "compound_to_pathway_index.tsv",
             map_to_ath_index_path=preprocessed_dir / "map_to_ath_index.tsv",
             pathway_annotation_index_path=preprocessed_dir / "pathway_annotation_index.tsv",
+            pathway_go_enrichment_index_path=preprocessed_dir / "pathway_go_enrichment.tsv",
+            gene_to_go_index_path=preprocessed_dir / "gene_to_go_index.tsv",
+            plant_reactome_pathway_index_path=preprocessed_dir / "plant_reactome_pathway_index.tsv",
+            plant_reactome_gene_index_path=preprocessed_dir / "plant_reactome_gene_index.tsv",
+            plant_reactome_alignment_path=preprocessed_dir / "plant_reactome_alignment.tsv",
             plant_evidence_index_path=preprocessed_dir / "plant_evidence_index.tsv",
             preprocess_metadata_path=preprocessed_dir / "preprocess_metadata.json",
             preprocessed_history_dir=preprocessed_history_dir,
@@ -267,6 +321,7 @@ class PipelinePaths:
             self.kegg_pathway_map_path,
             self.kegg_pathway_hierarchy_path,
             self.kegg_ath_gene_pathway_path,
+            self.go_basic_obo_path,
             self.pubchem_synonyms_path,
             self.lipidmaps_sdf_path,
             self.aracyc_compounds_path,
@@ -347,6 +402,14 @@ class PipelineContext:
     step3_release_text: str = ""
     ath_gene_counts: dict[str, int] = field(default_factory=dict)
     reactome_pathways: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    go_gene_index: dict[str, set[tuple[str, str]]] = field(default_factory=dict)
+    go_term_namespace: dict[str, str] = field(default_factory=dict)
+    pathway_go_enrichment: dict[str, dict[str, object]] = field(default_factory=dict)
+    go_vstamp: str = ""
+    plant_reactome_pathways: dict[str, dict[str, object]] = field(default_factory=dict)
+    plant_reactome_gene_sets: dict[str, set[str]] = field(default_factory=dict)
+    plant_reactome_alignments: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    plant_reactome_vstamp: str = ""
     preprocess_counts: Counter[str] = field(default_factory=Counter)
     preprocess_version: str = ""
 

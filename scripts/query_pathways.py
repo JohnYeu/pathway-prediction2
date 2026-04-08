@@ -194,11 +194,34 @@ class PathwayAnnotation:
     map_pathway_id: str
     ath_pathway_id: str
     pathway_name: str
+    map_id: str
+    kegg_name: str
+    brite_l1: str
+    brite_l2: str
+    brite_l3: str
+    kegg_vstamp: str
     pathway_group: str
     pathway_category: str
     map_pathway_compound_count: int
     ath_gene_count: int
+    go_top_terms_json: str
+    go_best_term: str
+    go_best_fdr: float
+    go_vstamp: str
+    plant_context_tags: tuple[str, ...]
+    plant_evidence_sources: tuple[str, ...]
+    aracyc_evidence_score: float
     reactome_matches: str
+    plant_reactome_matches_json: str
+    plant_reactome_best_id: str
+    plant_reactome_best_name: str
+    plant_reactome_best_category: str
+    plant_reactome_best_description: str
+    plant_reactome_alignment_score: float
+    plant_reactome_alignment_confidence: str
+    plant_reactome_tags: tuple[str, ...]
+    plant_reactome_vstamp: str
+    annotation_confidence: str
 
 
 @dataclass(slots=True)
@@ -256,6 +279,11 @@ class RankedPathway:
     relation_vstamp: str
     support_reaction_count: int
     role_summary: str
+    brite_summary: str
+    go_best_term: str
+    plant_context_tags: tuple[str, ...]
+    plant_reactome_best_category: str
+    annotation_confidence: str
     reason: str
 
 
@@ -745,11 +773,34 @@ def load_pathway_annotations(path: Path):
                 map_pathway_id=row["map_pathway_id"],
                 ath_pathway_id=row["ath_pathway_id"],
                 pathway_name=row["pathway_name"],
+                map_id=row.get("map_id", row["map_pathway_id"]),
+                kegg_name=row.get("kegg_name", row["pathway_name"]),
+                brite_l1=row.get("brite_l1", row.get("pathway_group", "")),
+                brite_l2=row.get("brite_l2", row.get("pathway_category", "")),
+                brite_l3=row.get("brite_l3", row["pathway_name"]),
+                kegg_vstamp=row.get("kegg_vstamp", ""),
                 pathway_group=row["pathway_group"],
                 pathway_category=row["pathway_category"],
                 map_pathway_compound_count=int(row["map_pathway_compound_count"] or 0),
                 ath_gene_count=int(row["ath_gene_count"] or 0),
                 reactome_matches=row["reactome_matches"],
+                go_top_terms_json=row.get("go_top_terms_json", ""),
+                go_best_term=row.get("go_best_term", ""),
+                go_best_fdr=float(row.get("go_best_fdr", "") or 0.0),
+                go_vstamp=row.get("go_vstamp", ""),
+                plant_context_tags=tuple(value for value in row.get("plant_context_tags", "").split(";") if value),
+                plant_evidence_sources=tuple(value for value in row.get("plant_evidence_sources", "").split(";") if value),
+                aracyc_evidence_score=float(row.get("aracyc_evidence_score", "") or 0.0),
+                plant_reactome_matches_json=row.get("plant_reactome_matches_json", ""),
+                plant_reactome_best_id=row.get("plant_reactome_best_id", ""),
+                plant_reactome_best_name=row.get("plant_reactome_best_name", ""),
+                plant_reactome_best_category=row.get("plant_reactome_best_category", ""),
+                plant_reactome_best_description=row.get("plant_reactome_best_description", ""),
+                plant_reactome_alignment_score=float(row.get("plant_reactome_alignment_score", "") or 0.0),
+                plant_reactome_alignment_confidence=row.get("plant_reactome_alignment_confidence", ""),
+                plant_reactome_tags=tuple(value for value in row.get("plant_reactome_tags", "").split(";") if value),
+                plant_reactome_vstamp=row.get("plant_reactome_vstamp", ""),
+                annotation_confidence=row.get("annotation_confidence", "low"),
             )
     return annotations
 
@@ -1003,6 +1054,8 @@ def rank_pathways(
                 "plantcyc_support": round(plant_bonus, 3),
                 "generic_pathway_penalty": generic_penalty,
                 "map_fallback_penalty": -0.10 if not annotation.ath_pathway_id else 0.0,
+                "annotation_quality_bonus": 0.03 if annotation.annotation_confidence == "high" else 0.01 if annotation.annotation_confidence == "medium" else 0.0,
+                "plant_reactome_alignment_bonus": 0.02 if annotation.plant_reactome_alignment_confidence == "high" else 0.01 if annotation.plant_reactome_alignment_confidence == "medium" else 0.0,
             }
             score = max(0.0, min(sum(contributions.values()), 0.999))
             confidence = "high" if score >= 0.70 and annotation.ath_pathway_id and annotation.ath_gene_count > 0 else "medium" if score >= 0.40 else "low"
@@ -1027,8 +1080,25 @@ def rank_pathways(
                 reason_parts.append("used map fallback because no ath-specific pathway was available")
             if annotation.ath_gene_count:
                 reason_parts.append(f"ath gene support: {annotation.ath_gene_count}")
+            if annotation.brite_l1 or annotation.brite_l2 or annotation.brite_l3:
+                reason_parts.append(
+                    "brite="
+                    + " / ".join(value for value in (annotation.brite_l1, annotation.brite_l2, annotation.brite_l3) if value)
+                )
+            if annotation.go_best_term:
+                if annotation.go_best_fdr > 0:
+                    reason_parts.append(f"GO BP: {annotation.go_best_term} (FDR {annotation.go_best_fdr:.3g})")
+                else:
+                    reason_parts.append(f"GO BP: {annotation.go_best_term}")
+            if annotation.plant_context_tags:
+                reason_parts.append(f"plant tags: {','.join(annotation.plant_context_tags)}")
             if plant:
                 reason_parts.append(f"{plant.plant_support_source} support: {plant.plant_support_examples}")
+            if annotation.plant_reactome_best_category:
+                reason_parts.append(
+                    f"Plant Reactome: {annotation.plant_reactome_best_category}"
+                    + (f" ({annotation.plant_reactome_alignment_confidence})" if annotation.plant_reactome_alignment_confidence else "")
+                )
             if positive_features:
                 reason_parts.append(f"top positive features: {';'.join(positive_features)}")
             if negative_features:
@@ -1047,6 +1117,7 @@ def rank_pathways(
                     "relation_vstamp": role.relation_vstamp if role else "",
                     "support_reaction_count": role.support_reaction_count if role else 0,
                     "role_summary": role.role_summary if role else "",
+                    "brite_summary": " / ".join(value for value in (annotation.brite_l1, annotation.brite_l2, annotation.brite_l3) if value),
                 },
             )
             if score > float(entry["score"]):
@@ -1057,6 +1128,7 @@ def rank_pathways(
                 entry["relation_vstamp"] = role.relation_vstamp if role else ""
                 entry["support_reaction_count"] = role.support_reaction_count if role else 0
                 entry["role_summary"] = role.role_summary if role else ""
+                entry["brite_summary"] = " / ".join(value for value in (annotation.brite_l1, annotation.brite_l2, annotation.brite_l3) if value)
             entry["support_ids"].add(mapping.kegg_compound_id)
             entry["support_names"].add(mapping.kegg_primary_name)
 
@@ -1087,6 +1159,11 @@ def rank_pathways(
                 relation_vstamp=str(entry["relation_vstamp"]),
                 support_reaction_count=int(entry["support_reaction_count"]),
                 role_summary=str(entry["role_summary"]),
+                brite_summary=str(entry["brite_summary"]),
+                go_best_term=annotation.go_best_term,
+                plant_context_tags=annotation.plant_context_tags,
+                plant_reactome_best_category=annotation.plant_reactome_best_category,
+                annotation_confidence=annotation.annotation_confidence,
                 reason=str(entry["reason"]),
             )
         )
@@ -1151,6 +1228,11 @@ def rank_pmn_fallback_pathways(
                 relation_vstamp="",
                 support_reaction_count=0,
                 role_summary="",
+                brite_summary="",
+                go_best_term="",
+                plant_context_tags=(),
+                plant_reactome_best_category="",
+                annotation_confidence=confidence,
                 reason="; ".join(reason_parts),
             )
         )
@@ -1176,6 +1258,11 @@ def rank_pmn_fallback_pathways(
             relation_vstamp=item.relation_vstamp,
             support_reaction_count=item.support_reaction_count,
             role_summary=item.role_summary,
+            brite_summary=item.brite_summary,
+            go_best_term=item.go_best_term,
+            plant_context_tags=item.plant_context_tags,
+            plant_reactome_best_category=item.plant_reactome_best_category,
+            annotation_confidence=item.annotation_confidence,
             reason=item.reason,
         )
         for index, item in enumerate(ranked[:top_k], start=1)
@@ -1214,12 +1301,22 @@ def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[Ra
             f"{pathway.pathway_rank}. {pathway.pathway_name} [{pathway.pathway_target_id}] "
             f"score={pathway.score:.3f} confidence={pathway.confidence_level}"
         )
+        if pathway.brite_summary:
+            print(f"   brite: {pathway.brite_summary}")
+        if pathway.go_best_term:
+            print(f"   go_best_term: {pathway.go_best_term}")
+        if pathway.plant_context_tags:
+            print(f"   plant_context_tags: {', '.join(pathway.plant_context_tags)}")
+        if pathway.plant_reactome_best_category:
+            print(f"   plant_reactome_category: {pathway.plant_reactome_best_category}")
         if pathway.relation_vstamp:
             print(f"   relation_vstamp: {pathway.relation_vstamp}")
         if pathway.support_reaction_count:
             print(f"   support_reactions: {pathway.support_reaction_count}")
         if pathway.role_summary:
             print(f"   role_summary: {pathway.role_summary}")
+        if pathway.annotation_confidence:
+            print(f"   annotation_confidence: {pathway.annotation_confidence}")
         if pathway.pathway_target_type == "pmn_direct":
             print("   source: direct AraCyc/PlantCyc (PMN) fallback")
         print(f"   reason: {pathway.reason}")

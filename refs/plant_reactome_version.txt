@@ -1,0 +1,1 @@
+{"source": "plant_reactome_content_service", "fetched_at": "2026-04-08T19:28:35.311003+00:00", "release_dates": ["2025-02-15"], "pathway_count": 281, "gene_link_count": 5773, "vstamp": "plant_reactome_2025-02-15"}

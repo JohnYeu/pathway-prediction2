@@ -28,7 +28,7 @@ from pathway_pipeline.step5_annotate_pathways import run as run_step5
 from pathway_pipeline.step6_score_pathways import run as run_step6
 
 
-PREPROCESS_VERSION = "preprocess-query-v5"
+PREPROCESS_VERSION = "preprocess-query-v6"
 
 
 def build_preprocess_metadata(context: PipelineContext) -> dict[str, object]:
@@ -37,6 +37,14 @@ def build_preprocess_metadata(context: PipelineContext) -> dict[str, object]:
     input_mtimes = {}
     for path in context.paths.required_inputs():
         input_mtimes[str(path.relative_to(context.paths.workdir))] = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
+    for path in (
+        context.paths.gene_association_tair_path,
+        context.paths.plant_reactome_pathways_path,
+        context.paths.plant_reactome_gene_pathway_path,
+        context.paths.plant_reactome_version_path,
+    ):
+        if path.exists():
+            input_mtimes[str(path.relative_to(context.paths.workdir))] = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
     return {
         "version": PREPROCESS_VERSION,
         "generated_at": datetime.now(tz=UTC).isoformat(),
@@ -53,6 +61,7 @@ def build_preprocess_metadata(context: PipelineContext) -> dict[str, object]:
             "Step 2 uses a PMN plant-first bridge-to-KEGG strategy: direct KEGG xref, exact InChIKey structure matches, PMN bridge evidence, then name fallback.",
             "Step 3 reads only versioned KEGG relation snapshots; query never performs live KEGG lookups.",
             "Step 3 adds compound -> reaction -> pathway role evidence and exports relation_vstamp, support reaction counts, and cofactor-aware role summaries.",
+            "Step 5 enriches pathways with KEGG BRITE hierarchy, Arabidopsis GO BP enrichment, PMN plant evidence, and Plant Reactome local alignment context.",
             "AraCyc and PlantCyc direct pathway support is exported so the query layer can fall back to PMN when KEGG coverage is missing.",
             "RDKit-backed plant_smiles_exact bridging is enabled only when RDKit is available at preprocess time; otherwise the method is explicitly disabled.",
             "Step 8 similarity fallback and step 9 extra PlantCyc reranking are intentionally excluded from this first query-oriented refactor.",
@@ -85,10 +94,21 @@ def run(context: PipelineContext) -> PipelineContext:
                 "map_pathway_id",
                 "relation_vstamp",
                 "pathway_name",
+                "map_id",
+                "kegg_name",
+                "brite_l1",
+                "brite_l2",
+                "brite_l3",
                 "pathway_group",
                 "pathway_category",
                 "map_pathway_compound_count",
                 "ath_gene_count",
+                "go_best_term",
+                "go_best_fdr",
+                "plant_context_tags",
+                "plant_reactome_best_category",
+                "plant_reactome_alignment_confidence",
+                "annotation_confidence",
                 "support_reaction_count",
                 "role_summary",
                 "plantcyc_support_source",
@@ -125,10 +145,21 @@ def run(context: PipelineContext) -> PipelineContext:
                         "map_pathway_id": row.map_pathway_id,
                         "relation_vstamp": row.relation_vstamp,
                         "pathway_name": row.pathway_name,
+                        "map_id": row.map_id,
+                        "kegg_name": row.kegg_name,
+                        "brite_l1": row.brite_l1,
+                        "brite_l2": row.brite_l2,
+                        "brite_l3": row.brite_l3,
                         "pathway_group": row.pathway_group,
                         "pathway_category": row.pathway_category,
                         "map_pathway_compound_count": row.map_pathway_compound_count,
                         "ath_gene_count": row.ath_gene_count,
+                        "go_best_term": row.go_best_term,
+                        "go_best_fdr": f"{row.go_best_fdr:.6g}" if row.go_best_fdr else "",
+                        "plant_context_tags": row.plant_context_tags,
+                        "plant_reactome_best_category": row.plant_reactome_best_category,
+                        "plant_reactome_alignment_confidence": row.plant_reactome_alignment_confidence,
+                        "annotation_confidence": row.annotation_confidence,
                         "support_reaction_count": row.support_reaction_count,
                         "role_summary": row.role_summary,
                         "plantcyc_support_source": row.plantcyc_support_source,

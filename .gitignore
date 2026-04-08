@@ -9,6 +9,8 @@ __pycache__/
 !refs/kegg_compound_pathway.tsv
 !refs/kegg_pathway_ath.tsv
 !refs/kegg_pathway_map.tsv
+!refs/plant_reactome_gene_pathway.tsv
+!refs/plant_reactome_pathways.tsv
 refs/ReactomePathwaysRelation.txt
 refs/go-basic.obo
 refs/knapsack_v1.200.03.tar.gz
