@@ -764,6 +764,55 @@ def build_name_formula_index(
     return dict(index)
 
 
+def normalize_inchi_key(value: str) -> str:
+    """Return a normalized full InChIKey string."""
+
+    return (value or "").strip().upper()
+
+
+def build_kegg_structure_indexes(
+    structures: dict[str, StructureInfo],
+    xrefs: dict[str, XrefInfo],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+) -> dict[str, dict[str, set[str]]]:
+    """Build exact InChIKey -> KEGG compound evidence.
+
+    The goal is to let step 2 prefer true structure identity before any
+    name-based correction. The index intentionally stores provenance labels so
+    later scoring can explain whether the KEGG structure link came from curated
+    ChEBI->KEGG xrefs or from external structure-bearing resources such as
+    LIPID MAPS.
+    """
+
+    by_inchi_key_full: defaultdict[str, defaultdict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+
+    for compound_id, info in xrefs.items():
+        structure = structures.get(compound_id)
+        if not structure:
+            continue
+        inchi_key = normalize_inchi_key(structure.standard_inchi_key)
+        if not inchi_key:
+            continue
+        for kegg_id in info.kegg_ids:
+            if KEGG_ID_RE.fullmatch(kegg_id):
+                by_inchi_key_full[inchi_key][kegg_id].add("ChEBI")
+
+    for record in lipidmaps_records.values():
+        inchi_key = normalize_inchi_key(record.inchi_key)
+        if not inchi_key:
+            continue
+        for kegg_id in record.kegg_ids:
+            if KEGG_ID_RE.fullmatch(kegg_id):
+                by_inchi_key_full[inchi_key][kegg_id].add("LIPID MAPS")
+
+    return {
+        "by_inchi_key_full": {
+            inchi_key: {kegg_id: set(sources) for kegg_id, sources in hits.items()}
+            for inchi_key, hits in by_inchi_key_full.items()
+        }
+    }
+
+
 def load_kegg_compounds(
     path: Path,
 ) -> tuple[
@@ -1402,15 +1451,17 @@ def build_candidate_mappings(
     kegg_alias_indexes: dict[str, defaultdict[str, set[str]]],
     kegg_primary_compact_delete_index: defaultdict[str, set[str]],
     name_formula_index: dict[str, set[str]],
+    kegg_structure_indexes: dict[str, dict[str, set[str]]],
 ) -> list[CandidateMapping]:
     """Build and score all KEGG candidates for one ChEBI compound.
 
     Matching order is intentional:
     1. direct curated cross-references
-    2. external structured support (PlantCyc, AraCyc, LIPID MAPS)
-    3. exact match to a KEGG standard name
-    4. exact match to a KEGG alias, then normalize back to the standard name
-    5. typo-correction fallback against KEGG standard names only, guarded by
+    2. exact InChIKey structure matches recovered from curated/external indexes
+    3. external structured support (PlantCyc, AraCyc, LIPID MAPS)
+    4. exact match to a KEGG standard name
+    5. exact match to a KEGG alias, then normalize back to the standard name
+    6. typo-correction fallback against KEGG standard names only, guarded by
        molecular formula compatibility
     """
 
@@ -1436,6 +1487,21 @@ def build_candidate_mappings(
                 direct_kegg_xref=True,
                 external_source="ChEBI",
             )
+
+    if structure and structure.standard_inchi_key:
+        inchi_key = normalize_inchi_key(structure.standard_inchi_key)
+        for kegg_id, sources in sorted(kegg_structure_indexes.get("by_inchi_key_full", {}).get(inchi_key, {}).items()):
+            if kegg_id not in kegg_compounds:
+                continue
+            for source_label in sorted(sources):
+                source_score = 0.985 if source_label == "ChEBI" else 0.980
+                candidate_for(kegg_id).add_evidence(
+                    score=source_score,
+                    method="inchi_key_exact",
+                    reason=f"Exact InChIKey match links {compound.chebi_accession} to {kegg_id} via {source_label}",
+                    external_source=source_label,
+                    has_structure_evidence=True,
+                )
 
     for record_id, methods in context.matched_plantcyc_methods.items():
         record = plantcyc_records[record_id]
@@ -1625,6 +1691,8 @@ def mapping_method_label(mapping: CandidateMapping) -> str:
 
     if mapping.direct_kegg_xref:
         return "chebi_kegg_xref"
+    if "inchi_key_exact" in mapping.methods:
+        return "inchi_key_exact"
     if mapping.has_structure_evidence and "LIPID MAPS" in mapping.external_sources:
         return "lipidmaps_structure_crossref"
     if mapping.external_sources & {"AraCyc", "PlantCyc"}:
@@ -1669,6 +1737,7 @@ def process_compounds(
     kegg_alias_indexes: dict[str, defaultdict[str, set[str]]],
     kegg_primary_compact_delete_index: defaultdict[str, set[str]],
     name_formula_index: dict[str, set[str]],
+    kegg_structure_indexes: dict[str, dict[str, set[str]]],
     alias_output_path: Path,
     mapping_summary_path: Path,
     mapping_selected_path: Path,
@@ -1792,6 +1861,7 @@ def process_compounds(
                 kegg_alias_indexes=kegg_alias_indexes,
                 kegg_primary_compact_delete_index=kegg_primary_compact_delete_index,
                 name_formula_index=name_formula_index,
+                kegg_structure_indexes=kegg_structure_indexes,
             )
             selected = select_candidates(ranked)
             selected_by_compound[compound_id] = selected
@@ -2243,6 +2313,7 @@ def main() -> None:
     )
     lipidmaps_records, lipidmaps_indexes, lipidmaps_pubchem_cids = load_lipidmaps_records(refs / "lmsd_extended.sdf.zip")
     name_formula_index = build_name_formula_index(base_aliases, structures, plantcyc_records, lipidmaps_records)
+    kegg_structure_indexes = build_kegg_structure_indexes(structures, xrefs, lipidmaps_records)
     target_pubchem_cids = set(plantcyc_pubchem_cids) | set(lipidmaps_pubchem_cids)
     for info in xrefs.values():
         target_pubchem_cids.update(info.pubchem_cids)
@@ -2264,6 +2335,7 @@ def main() -> None:
         kegg_alias_indexes=kegg_alias_indexes,
         kegg_primary_compact_delete_index=kegg_primary_compact_delete_index,
         name_formula_index=name_formula_index,
+        kegg_structure_indexes=kegg_structure_indexes,
         alias_output_path=outputs / "chebi_aliases_standardized_v2.tsv",
         mapping_summary_path=outputs / "chebi_kegg_mapping_v2.tsv",
         mapping_selected_path=outputs / "chebi_kegg_selected_v2.tsv",

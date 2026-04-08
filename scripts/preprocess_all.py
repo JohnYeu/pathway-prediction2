@@ -15,6 +15,7 @@ from process_chebi_to_pathways_v2 import (
     build_candidate_mappings,
     build_compound_context,
     build_name_formula_index,
+    build_kegg_structure_indexes,
     build_variants,
     load_ath_gene_counts,
     load_ath_pathways,
@@ -35,13 +36,14 @@ from process_chebi_to_pathways_v2 import (
     load_xrefs,
     mapping_confidence_label,
     mapping_method_label,
+    normalize_inchi_key,
     normalize_name,
     select_candidates,
 )
 
 
 PREPROCESSED_DIRNAME = "preprocessed"
-VERSION = "preprocess-query-v2"
+VERSION = "preprocess-query-v3"
 PROGRESS_EVERY = 10000
 
 
@@ -331,6 +333,89 @@ def write_name_to_kegg_index(path: Path, compounds, selected_by_compound) -> int
     return row_count
 
 
+def write_compound_structure_kegg_index(path: Path, compounds, structures, kegg_compounds, kegg_structure_indexes) -> int:
+    """Write compound_id -> KEGG mappings recovered from exact InChIKey identity.
+
+    This index is cheap to build and lets query-time step 2 truly prefer exact
+    structure identity over name-based mapping.
+    """
+
+    row_count = 0
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "canonical_name",
+                "canonical_exact_name",
+                "canonical_compact_name",
+                "canonical_singular_name",
+                "canonical_stereo_stripped_name",
+                "inchi_key",
+                "kegg_compound_id",
+                "kegg_primary_name",
+                "mapping_score",
+                "mapping_confidence_level",
+                "mapping_method",
+                "direct_kegg_xref",
+                "has_structure_evidence",
+                "used_pubchem_synonym",
+                "best_alias",
+                "best_alias_source",
+                "best_variant",
+                "evidence_count",
+                "external_sources",
+                "mapping_reason",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for compound_id in sorted(compounds, key=int):
+            compound = compounds[compound_id]
+            structure = structures.get(compound_id)
+            if not structure or not structure.standard_inchi_key:
+                continue
+            inchi_key = normalize_inchi_key(structure.standard_inchi_key)
+            hits = kegg_structure_indexes.get("by_inchi_key_full", {}).get(inchi_key, {})
+            if not hits:
+                continue
+            canonical_variants = build_variants(compound.name)
+            for kegg_compound_id, sources in sorted(hits.items()):
+                if kegg_compound_id not in kegg_compounds:
+                    continue
+                source_set = set(sources)
+                score = 0.99 if source_set >= {"ChEBI", "LIPID MAPS"} else 0.985 if "ChEBI" in source_set else 0.980
+                writer.writerow(
+                    {
+                        "compound_id": compound_id,
+                        "chebi_accession": compound.chebi_accession,
+                        "canonical_name": compound.name,
+                        "canonical_exact_name": canonical_variants["exact"],
+                        "canonical_compact_name": canonical_variants["compact"],
+                        "canonical_singular_name": canonical_variants["singular"],
+                        "canonical_stereo_stripped_name": canonical_variants["stereo_stripped"],
+                        "inchi_key": inchi_key,
+                        "kegg_compound_id": kegg_compound_id,
+                        "kegg_primary_name": kegg_compounds[kegg_compound_id].primary_name,
+                        "mapping_score": f"{score:.3f}",
+                        "mapping_confidence_level": "high",
+                        "mapping_method": "inchi_key_exact",
+                        "direct_kegg_xref": "false",
+                        "has_structure_evidence": "true",
+                        "used_pubchem_synonym": "false",
+                        "best_alias": "",
+                        "best_alias_source": "",
+                        "best_variant": "inchi_key_exact",
+                        "evidence_count": len(source_set),
+                        "external_sources": ";".join(sorted(source_set)),
+                        "mapping_reason": f"Exact InChIKey match to {kegg_compound_id} via {','.join(sorted(source_set))}",
+                    }
+                )
+                row_count += 1
+    return row_count
+
+
 def write_compound_to_pathway_index(path: Path, kegg_to_pathways) -> int:
     """Write the KEGG compound -> map pathway index for query step 3."""
 
@@ -454,7 +539,17 @@ def write_pathway_annotation_index(
 
 
 def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcyc_pathway_stats) -> int:
-    """Write precomputed compound -> pathway-name plant support evidence."""
+    """Write precomputed compound -> PMN pathway evidence.
+
+    This table serves two roles:
+
+    1. KEGG-backed ranking boost: if a KEGG pathway name matches an AraCyc or
+       PlantCyc pathway name already seen for the same compound, query-side
+       scoring adds a plant-specific support bonus.
+    2. Direct PMN fallback: when KEGG has no usable compound/pathway mapping,
+       query-side logic can still return plant pathways supported by AraCyc or
+       PlantCyc for the resolved compound.
+    """
 
     row_count = 0
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -466,6 +561,7 @@ def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcy
                 "canonical_name",
                 "pathway_name_normalized",
                 "plant_support_source",
+                "plant_pathway_ids",
                 "plant_support_examples",
                 "plant_support_bonus",
                 "plant_support_gene_count",
@@ -478,7 +574,8 @@ def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcy
             compound_context = compound_contexts[compound_id]
 
             for normalized_name, names in sorted(compound_context.aracyc_pathways.items()):
-                gene_count = len(plantcyc_pathway_stats["AraCyc"].get(normalized_name, {}).get("gene_ids", set()))
+                pathway_stat = plantcyc_pathway_stats["AraCyc"].get(normalized_name, {})
+                gene_count = len(pathway_stat.get("gene_ids", set()))
                 writer.writerow(
                     {
                         "compound_id": compound_id,
@@ -486,6 +583,7 @@ def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcy
                         "canonical_name": compound.name,
                         "pathway_name_normalized": normalized_name,
                         "plant_support_source": "AraCyc",
+                        "plant_pathway_ids": ";".join(sorted(pathway_stat.get("pathway_ids", set()))),
                         "plant_support_examples": ";".join(sorted(names)[:3]),
                         "plant_support_bonus": "0.060",
                         "plant_support_gene_count": gene_count,
@@ -494,7 +592,8 @@ def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcy
                 row_count += 1
 
             for normalized_name, names in sorted(compound_context.plantcyc_pathways.items()):
-                gene_count = len(plantcyc_pathway_stats["PlantCyc"].get(normalized_name, {}).get("gene_ids", set()))
+                pathway_stat = plantcyc_pathway_stats["PlantCyc"].get(normalized_name, {})
+                gene_count = len(pathway_stat.get("gene_ids", set()))
                 writer.writerow(
                     {
                         "compound_id": compound_id,
@@ -502,6 +601,7 @@ def write_plant_evidence_index(path: Path, compounds, compound_contexts, plantcy
                         "canonical_name": compound.name,
                         "pathway_name_normalized": normalized_name,
                         "plant_support_source": "PlantCyc",
+                        "plant_pathway_ids": ";".join(sorted(pathway_stat.get("pathway_ids", set()))),
                         "plant_support_examples": ";".join(sorted(names)[:3]),
                         "plant_support_bonus": "0.040",
                         "plant_support_gene_count": gene_count,
@@ -527,6 +627,8 @@ def build_metadata(workdir: Path, output_dir: Path, counts: dict[str, int]) -> d
         "notes": [
             "The query pipeline consumes only outputs/preprocessed/* and does not rescan refs/ during interactive or one-shot queries.",
             "Weak step-1 matches are guarded by formula compatibility, InChIKey connectivity prefixes, and chemistry-sensitive name semantics.",
+            "Step 2 prefers exact InChIKey-based KEGG structure matches before falling back to name-based KEGG resolution.",
+            "AraCyc and PlantCyc direct pathway support is exported so the query layer can fall back to PMN when KEGG coverage is missing.",
             "Step 8 similarity fallback and step 9 extra PlantCyc reranking are intentionally excluded from this first query-oriented refactor.",
         ],
     }
@@ -580,6 +682,7 @@ def main() -> None:
     )
     lipidmaps_records, lipidmaps_indexes, lipidmaps_pubchem_cids = load_lipidmaps_records(refs / "lmsd_extended.sdf.zip")
     name_formula_index = build_name_formula_index(base_aliases, structures, plantcyc_records, lipidmaps_records)
+    kegg_structure_indexes = build_kegg_structure_indexes(structures, xrefs, lipidmaps_records)
     target_pubchem_cids = set(plantcyc_pubchem_cids) | set(lipidmaps_pubchem_cids)
     for info in xrefs.values():
         target_pubchem_cids.update(info.pubchem_cids)
@@ -617,6 +720,7 @@ def main() -> None:
             kegg_alias_indexes=kegg_alias_indexes,
             kegg_primary_compact_delete_index=kegg_primary_compact_delete_index,
             name_formula_index=name_formula_index,
+            kegg_structure_indexes=kegg_structure_indexes,
         )
         selected = select_candidates(ranked)
         selected_by_compound[compound_id] = selected
@@ -651,6 +755,13 @@ def main() -> None:
         output_dir / "name_to_kegg_index.tsv",
         compounds,
         selected_by_compound,
+    )
+    counts["compound_structure_kegg_index"] = write_compound_structure_kegg_index(
+        output_dir / "compound_structure_kegg_index.tsv",
+        compounds,
+        structures,
+        kegg_compounds,
+        kegg_structure_indexes,
     )
     counts["compound_to_pathway_index"] = write_compound_to_pathway_index(
         output_dir / "compound_to_pathway_index.tsv",

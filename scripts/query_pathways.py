@@ -200,6 +200,7 @@ class PathwayAnnotation:
 @dataclass(slots=True)
 class PlantEvidence:
     plant_support_source: str
+    plant_pathway_ids: tuple[str, ...]
     plant_support_examples: str
     plant_support_bonus: float
     plant_support_gene_count: int
@@ -559,6 +560,48 @@ def load_name_to_kegg(path: Path):
     )
 
 
+def load_structure_to_kegg(path: Path):
+    """Load exact InChIKey-driven KEGG mappings keyed by compound_id."""
+
+    mappings = defaultdict(list)
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            mappings[row["compound_id"]].append(
+                MappingRecord(
+                    compound_id=row["compound_id"],
+                    chebi_accession=row["chebi_accession"],
+                    canonical_name=row["canonical_name"],
+                    canonical_exact_name=row["canonical_exact_name"],
+                    canonical_compact_name=row["canonical_compact_name"],
+                    canonical_singular_name=row["canonical_singular_name"],
+                    canonical_stereo_stripped_name=row["canonical_stereo_stripped_name"],
+                    kegg_compound_id=row["kegg_compound_id"],
+                    kegg_primary_name=row["kegg_primary_name"],
+                    mapping_score=float(row["mapping_score"]),
+                    mapping_confidence_level=row["mapping_confidence_level"],
+                    mapping_method=row["mapping_method"],
+                    direct_kegg_xref=row["direct_kegg_xref"].lower() == "true",
+                    has_structure_evidence=row["has_structure_evidence"].lower() == "true",
+                    used_pubchem_synonym=row["used_pubchem_synonym"].lower() == "true",
+                    best_alias=row["best_alias"],
+                    best_alias_source=row["best_alias_source"],
+                    best_variant=row["best_variant"],
+                    evidence_count=int(row["evidence_count"] or 0),
+                    external_sources=tuple(value for value in row["external_sources"].split(";") if value),
+                    mapping_reason=row["mapping_reason"],
+                )
+            )
+    for compound_id in mappings:
+        mappings[compound_id].sort(
+            key=lambda item: (item.mapping_score, item.has_structure_evidence, item.kegg_compound_id),
+            reverse=True,
+        )
+    return dict(mappings)
+
+
 def load_compound_to_pathway(path: Path):
     """Load KEGG compound -> map pathway links."""
 
@@ -614,6 +657,7 @@ def load_plant_evidence(path: Path):
         for row in reader:
             item = PlantEvidence(
                 plant_support_source=row["plant_support_source"],
+                plant_pathway_ids=tuple(value for value in row.get("plant_pathway_ids", "").split(";") if value),
                 plant_support_examples=row["plant_support_examples"],
                 plant_support_bonus=float(row["plant_support_bonus"]),
                 plant_support_gene_count=int(row["plant_support_gene_count"] or 0),
@@ -916,6 +960,89 @@ def rank_pathways(
     return rows
 
 
+def rank_pmn_fallback_pathways(
+    resolved: ResolvedName,
+    plant_evidence,
+    top_k: int,
+    had_kegg_mapping: bool,
+) -> list[RankedPathway]:
+    """Use direct AraCyc/PlantCyc support when KEGG coverage is missing.
+
+    This is the main mitigation for step-2 limitation #1: compounds that are
+    plausibly resolved by name but have no reliable KEGG compound mapping (or
+    no KEGG pathway links) should still return plant-specific pathways from PMN.
+    """
+
+    evidence_by_name = plant_evidence.get(resolved.compound_id, {})
+    if not evidence_by_name:
+        return []
+
+    ranked = []
+    for normalized_name, plant in evidence_by_name.items():
+        example_names = [value for value in plant.plant_support_examples.split(";") if value]
+        pathway_name = example_names[0] if example_names else normalized_name
+        pathway_id = plant.plant_pathway_ids[0] if plant.plant_pathway_ids else f"{plant.plant_support_source}:{normalized_name}"
+
+        gene_bonus = 0.10 if plant.plant_support_gene_count else 0.0
+        dense_gene_bonus = 0.05 if plant.plant_support_gene_count >= 3 else 0.0
+        source_bonus = 0.07 if plant.plant_support_source == "AraCyc" else 0.05
+        score = min(0.999, 0.45 + plant.plant_support_bonus + gene_bonus + dense_gene_bonus + source_bonus)
+        confidence = "high" if plant.plant_support_source == "AraCyc" and plant.plant_support_gene_count > 0 else "medium" if plant.plant_support_gene_count > 0 else "low"
+
+        reason_parts = [
+            "direct PMN fallback",
+            f"score {score:.3f}",
+            f"{plant.plant_support_source} compound-pathway support",
+        ]
+        if not had_kegg_mapping:
+            reason_parts.append("used because no KEGG compound mapping was available")
+        else:
+            reason_parts.append("used because no KEGG pathway links were available")
+        if plant.plant_pathway_ids:
+            reason_parts.append(f"pathway ids: {','.join(plant.plant_pathway_ids[:3])}")
+        if plant.plant_support_gene_count:
+            reason_parts.append(f"PMN gene support: {plant.plant_support_gene_count}")
+        if plant.plant_support_examples:
+            reason_parts.append(f"pathway names: {plant.plant_support_examples}")
+
+        ranked.append(
+            RankedPathway(
+                pathway_rank=0,
+                pathway_target_id=pathway_id,
+                pathway_target_type="pmn_direct",
+                pathway_name=pathway_name,
+                score=score,
+                confidence_level=confidence,
+                support_kegg_compound_ids=(),
+                support_kegg_names=(),
+                reason="; ".join(reason_parts),
+            )
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            item.score,
+            item.confidence_level == "high",
+            item.pathway_target_id,
+        ),
+        reverse=True,
+    )
+    return [
+        RankedPathway(
+            pathway_rank=index,
+            pathway_target_id=item.pathway_target_id,
+            pathway_target_type=item.pathway_target_type,
+            pathway_name=item.pathway_name,
+            score=item.score,
+            confidence_level=item.confidence_level,
+            support_kegg_compound_ids=item.support_kegg_compound_ids,
+            support_kegg_names=item.support_kegg_names,
+            reason=item.reason,
+        )
+        for index, item in enumerate(ranked[:top_k], start=1)
+    ]
+
+
 def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[RankedPathway], top_k: int) -> None:
     """Render a one-shot query result to the terminal."""
 
@@ -948,6 +1075,8 @@ def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[Ra
             f"{pathway.pathway_rank}. {pathway.pathway_name} [{pathway.pathway_target_id}] "
             f"score={pathway.score:.3f} confidence={pathway.confidence_level}"
         )
+        if pathway.pathway_target_type == "pmn_direct":
+            print("   source: direct AraCyc/PlantCyc (PMN) fallback")
         print(f"   reason: {pathway.reason}")
 
 
@@ -959,6 +1088,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         "name_normalization_index": data_dir / "name_normalization_index.tsv",
         "name_to_formula_index": data_dir / "name_to_formula_index.tsv",
         "name_to_kegg_index": data_dir / "name_to_kegg_index.tsv",
+        "compound_structure_kegg_index": data_dir / "compound_structure_kegg_index.tsv",
         "compound_to_pathway_index": data_dir / "compound_to_pathway_index.tsv",
         "map_to_ath_index": data_dir / "map_to_ath_index.tsv",
         "pathway_annotation_index": data_dir / "pathway_annotation_index.tsv",
@@ -980,6 +1110,9 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         print("- name-to-KEGG index", flush=True)
     mappings_by_name, best_mapping_score_by_compound = load_name_to_kegg(paths["name_to_kegg_index"])
     if verbose:
+        print("- structure-to-KEGG index", flush=True)
+    structure_mappings_by_compound = load_structure_to_kegg(paths["compound_structure_kegg_index"])
+    if verbose:
         print("- KEGG compound-to-pathway index", flush=True)
     compound_to_pathway = load_compound_to_pathway(paths["compound_to_pathway_index"])
     if verbose:
@@ -1000,6 +1133,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         "structure_index_path": paths["name_to_formula_index"],
         "verbose": verbose,
         "mappings_by_name": mappings_by_name,
+        "structure_mappings_by_compound": structure_mappings_by_compound,
         "best_mapping_score_by_compound": best_mapping_score_by_compound,
         "compound_to_pathway": compound_to_pathway,
         "map_to_ath": map_to_ath,
@@ -1032,7 +1166,15 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
     )
     if resolved is None:
         return None, [], []
-    mappings = lookup_mappings_for_standard_name(resolved.canonical_name, state["mappings_by_name"])
+    name_mappings = lookup_mappings_for_standard_name(resolved.canonical_name, state["mappings_by_name"])
+    structure_mappings = state["structure_mappings_by_compound"].get(resolved.compound_id, [])
+    direct_name_mappings = [mapping for mapping in name_mappings if mapping.direct_kegg_xref]
+    if direct_name_mappings:
+        mappings = direct_name_mappings
+    elif structure_mappings:
+        mappings = structure_mappings
+    else:
+        mappings = name_mappings
     pathways = rank_pathways(
         resolved,
         mappings,
@@ -1042,6 +1184,13 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
         state["plant_evidence"],
         top_k,
     )
+    if not pathways:
+        pathways = rank_pmn_fallback_pathways(
+            resolved,
+            state["plant_evidence"],
+            top_k,
+            had_kegg_mapping=bool(mappings),
+        )
     return resolved, mappings, pathways
 
 
