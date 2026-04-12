@@ -41,6 +41,11 @@ BLOCK_QUERY_RE = re.compile(r"^block:([A-Z]{14})$")
 SMILES_QUERY_RE = re.compile(r"^smiles:(.+)$", re.IGNORECASE)
 CACHE_SCHEMA_VERSION = 1
 VARIANT_ORDER = ("exact", "compact", "singular", "stereo_stripped")
+# Layer 1.5 ChEBI recovery only uses whitespace-insensitive variants so the
+# "strict exact lookup" promise isn't broken by singularization or stereo
+# prefix stripping — both can change chemical identity (e.g. L-glucose vs
+# D-glucose, "amines" as plural vs "amine" as a specific compound).
+CHEBI_STRICT_VARIANT_ORDER = ("exact", "compact")
 FUZZY_MIN_RATIO = 0.85
 FUZZY_AUTO_RATIO = 0.92
 FUZZY_MIN_GAP = 0.05
@@ -588,6 +593,8 @@ def ensure_arabidopsis_structure_index(state: dict[str, Any], verbose: bool = Fa
     cache_path = workdir / "outputs" / "preprocessed" / "query_arabidopsis_structure_index.pkl"
     pathway_output_path = workdir / "outputs" / "chebi_pathways_aracyc_refactored.tsv"
     structures_path = workdir / "refs" / "structures.tsv.gz"
+    compounds_path = workdir / "compounds.tsv"
+    chemical_data_path = workdir / "refs" / "chemical_data.tsv.gz"
     chebi_structure_lookup = ensure_chebi_structure_lookup(state, verbose=verbose)
     pathway_index: dict[str, list[AraCycRankedPathway]] = state["pathway_index"]
 
@@ -617,7 +624,7 @@ def ensure_arabidopsis_structure_index(state: dict[str, Any], verbose: bool = Fa
         builder,
         "query_arabidopsis_structure_index.pkl",
         verbose,
-        sources=[pathway_output_path, structures_path],
+        sources=[pathway_output_path, structures_path, compounds_path, chemical_data_path],
     )
     records: list[StructureRecord] = []
     by_full_inchikey: dict[str, list[StructureRecord]] = {}
@@ -717,12 +724,12 @@ def fuzzy_match_arabidopsis(query: str, state: dict[str, Any]) -> FuzzyMatchOutc
 
 
 def recover_chebi_exact_candidates(query: str, state: dict[str, Any], verbose: bool = False) -> list[ChEBIExactCandidate]:
-    """Recover full ChEBI entities using exact hash lookups only."""
+    """Recover ChEBI entities by strict exact or whitespace-only match."""
     lookup = ensure_chebi_name_lookup(state, verbose=verbose)
     query_variants = build_variants(query)
     candidate_ids: list[str] = []
 
-    for variant in VARIANT_ORDER:
+    for variant in CHEBI_STRICT_VARIANT_ORDER:
         variant_text = query_variants.get(variant, "")
         if not variant_text:
             continue
@@ -1171,6 +1178,27 @@ def run_query(
 
     chebi_candidates = recover_chebi_exact_candidates(text, state, verbose=False)
     if chebi_candidates:
+        # Ambiguity guard: if the strict name points to more than one distinct
+        # ChEBI entity, refuse to silently union their pathways. Return the
+        # candidates as did_you_mean so the user can pick a specific entity.
+        unique_ids = {c.compound_id for c in chebi_candidates}
+        if len(unique_ids) > 1:
+            ambiguous_suggestions = tuple(
+                f"{c.name} ({c.chebi_accession})" for c in chebi_candidates[:MAX_FUZZY_SUGGESTIONS]
+            )
+            return QueryResult(
+                query=text,
+                match_type="",
+                resolution_path="plain_text -> chebi_exact -> ambiguous",
+                mappings=[],
+                pathways=[],
+                expanded=[],
+                did_you_mean=ambiguous_suggestions,
+                note=(
+                    f"Query matches {len(chebi_candidates)} distinct ChEBI entities; "
+                    "refusing to auto-project. Pick one by its ChEBI accession or a more specific name."
+                ),
+            )
         result = resolve_recovered_chebi_candidates(text, chebi_candidates, state, top_k=top_k)
         if did_you_mean and not result.did_you_mean:
             result.did_you_mean = did_you_mean
