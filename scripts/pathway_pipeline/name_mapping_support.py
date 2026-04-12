@@ -46,7 +46,7 @@ from process_chebi_to_pathways_v2 import (
 
 from pathway_pipeline.cli_utils import build_context, build_parser, format_counter, print_summary
 from pathway_pipeline.context import PipelineContext
-from pathway_pipeline.step1_alias_standardization import run as run_step1
+from pathway_pipeline.step1_standardize_names import run as run_step1
 
 
 PROGRESS_EVERY = 10000

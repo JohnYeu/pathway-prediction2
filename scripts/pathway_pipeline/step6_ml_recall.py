@@ -1,33 +1,19 @@
-"""Step 8: expanded recall — PMN-first candidate generation + ML filtering.
+"""Step 6 (AraCyc-first): ML supplemental recall for compounds without AraCyc pathway hits.
 
-This step supplements the high-confidence KEGG-first primary chain with a
-lower-confidence expanded pathway layer. It targets three categories of
-compounds that the primary chain leaves without pathway annotations:
+This step supplements the AraCyc primary chain with ML-scored expanded
+candidates. Feature extraction and model training are self-contained.
 
-- ``unmapped``: no KEGG compound mapping at all
-- ``no_kegg_bridge``: matched a PMN record but could not bridge to KEGG
-- ``mapped_without_pathway``: mapped to a KEGG compound but no KEGG pathway
+Candidate sources:
+1. PlantCyc direct compound→pathway links (compounds without AraCyc match)
+2. Structural similarity neighbors with known pathways
 
-Expanded candidates are generated from:
-1. Direct PMN (AraCyc/PlantCyc) compound→pathway links
-2. Weak KEGG candidates rejected by the step-2 conservative selection
-3. Plant Reactome pathway context (semantic label enrichment only in v1)
-
-A LogisticRegression model is trained on the primary chain's high-confidence
-compound-pathway pairs (positive) vs hard negatives, then used to score and
-filter expanded candidates. Only candidates with ``ml_score >= 0.55`` are
-retained in the final expanded prediction table.
-
-The expanded layer is kept strictly separate from the primary results and
-marked as ``experimental/expanded`` throughout.
+Training positives come from the AraCyc primary chain (score >= 0.50).
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
-import math
 import re
 import sys
 import warnings
@@ -39,7 +25,6 @@ import numpy as np
 
 try:
     from rdkit import RDLogger
-
     RDLogger.DisableLog("rdApp.*")
 except Exception:
     pass
@@ -49,18 +34,10 @@ if __package__ in {None, ""}:
 
 from process_chebi_to_pathways_v2 import (
     PlantCycCompound,
-    build_variants,
     normalize_name,
 )
 
-from pathway_pipeline.cli_utils import build_context, build_parser, format_counter, print_summary
 from pathway_pipeline.context import PipelineContext
-from pathway_pipeline.step1_alias_standardization import run as run_step1
-from pathway_pipeline.step2_map_names_to_kegg import run as run_step2
-from pathway_pipeline.step3_link_compounds_to_pathways import run as run_step3
-from pathway_pipeline.step4_map_to_ath import run as run_step4
-from pathway_pipeline.step5_annotate_pathways import run as run_step5
-from pathway_pipeline.step6_score_pathways import run as run_step6
 
 
 # ---------------------------------------------------------------------------
@@ -70,14 +47,11 @@ from pathway_pipeline.step6_score_pathways import run as run_step6
 ML_SCORE_THRESHOLD = 0.55
 RANDOM_SEED = 42
 PROGRESS_EVERY = 20000
-MODEL_VERSION = "step8_expanded_recall_v2"
+MODEL_VERSION = "step6_aracyc_ml_recall_v1"
 FEATURE_SET_VERSION = "chemistry_structure_pair_v1"
 
 EC_RE = re.compile(r"(?:EC-)?\d+(?:\.[\d-]+){1,3}", re.I)
 
-# These are kept in output metadata/audit tables but excluded from the model
-# because they describe where evidence came from, not whether the compound and
-# pathway are chemically compatible.
 MODEL_EXCLUDED_FEATURE_NAMES = {
     "arabidopsis_supported",
     "has_aracyc",
@@ -98,7 +72,6 @@ MODEL_EXCLUDED_FEATURE_PREFIXES = (
     "status_",
 )
 
-# Semantic class keywords matched against compound name + definition
 SEMANTIC_CLASS_PATTERNS: dict[str, re.Pattern] = {
     "lipid": re.compile(r"\blipid|fatty acid|acylglycerol|sphingo|ceramide|phospholipid|glycerolipid", re.I),
     "amino_acid": re.compile(r"\bamino.?acid|aminoacid|\b[dl]-(?:ala|arg|asn|asp|cys|glu|gln|gly|his|ile|leu|lys|met|phe|pro|ser|thr|trp|tyr|val)\b", re.I),
@@ -114,7 +87,6 @@ SEMANTIC_CLASS_PATTERNS: dict[str, re.Pattern] = {
     "hormone_related": re.compile(r"\bhormone|auxin|cytokinin|abscisic|brassinosteroid|jasmonate|salicylate|ethylene.?(?:biosyn|signal)", re.I),
 }
 
-# Pathway-level category keywords for semantic consistency scoring
 PATHWAY_CATEGORY_KEYWORDS: dict[str, set[str]] = {
     "lipid": {"lipid", "fatty", "sphingolipid", "glycerolipid", "glycerophospholipid", "wax", "cutin", "suberin"},
     "amino_acid": {"amino", "alanine", "arginine", "asparagine", "aspartate", "cysteine", "glutamate", "glutamine", "glycine", "histidine", "isoleucine", "leucine", "lysine", "methionine", "phenylalanine", "proline", "serine", "threonine", "tryptophan", "tyrosine", "valine"},
@@ -125,6 +97,34 @@ PATHWAY_CATEGORY_KEYWORDS: dict[str, set[str]] = {
     "terpenoid": {"terpenoid", "terpene", "carotenoid", "sterol", "brassinosteroid", "gibberellin", "monoterpenoid", "sesquiterpenoid", "diterpenoid", "triterpenoid"},
     "alkaloid": {"alkaloid", "indole", "tropane", "glucosinolate"},
 }
+
+EXPANDED_CANDIDATE_FIELDS = [
+    "compound_id",
+    "chebi_accession",
+    "chebi_name",
+    "pathway_id",
+    "pathway_name",
+    "pathway_source",
+    "candidate_origin",
+    "bridge_method",
+    "ec_numbers",
+    "reaction_equation",
+]
+
+ML_PREDICTION_FIELDS = [
+    "compound_id",
+    "chebi_accession",
+    "chebi_name",
+    "pathway_id",
+    "pathway_name",
+    "pathway_source",
+    "candidate_origin",
+    "ml_score",
+    "ml_confidence",
+    "is_expanded_candidate",
+    "bridge_method",
+    "reason",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +161,21 @@ class TrainingPair:
 
 
 # ---------------------------------------------------------------------------
-# 1. Expanded candidate generation
+# PMN index helpers
 # ---------------------------------------------------------------------------
+
+
+def _split_ec_numbers(value: str) -> tuple[str, ...]:
+    """Parse PMN EC values into normalized EC-* tokens."""
+
+    ecs: set[str] = set()
+    for match in EC_RE.findall(value or ""):
+        token = match.upper()
+        if not token.startswith("EC-"):
+            token = f"EC-{token}"
+        ecs.add(token)
+    return tuple(sorted(ecs))
+
 
 def _build_pmn_compound_pathway_index(
     context: PipelineContext,
@@ -212,50 +225,6 @@ def _build_pmn_compound_pathway_index(
             for pathway in record.pathways:
                 index[record.compound_id].append((pathway, record.source_db, (), "", record_id))
     return dict(index)
-
-
-def _split_ec_numbers(value: str) -> tuple[str, ...]:
-    """Parse PMN EC values into normalized EC-* tokens."""
-
-    ecs: set[str] = set()
-    for match in EC_RE.findall(value or ""):
-        token = match.upper()
-        if not token.startswith("EC-"):
-            token = f"EC-{token}"
-        ecs.add(token)
-    return tuple(sorted(ecs))
-
-
-def _lookup_pmn_reaction_context(
-    pmn_index: dict[str, list[tuple[str, str, tuple[str, ...], str, str]]],
-    *,
-    source_db: str,
-    pmn_compound_id: str,
-    pathway_name: str,
-) -> tuple[tuple[str, ...], str]:
-    """Return ECs and representative reaction text for one PMN compound/pathway link."""
-
-    ecs: set[str] = set()
-    reactions: list[str] = []
-    for row_pathway, row_source, row_ecs, reaction_equation, _record_id in pmn_index.get(pmn_compound_id, []):
-        if row_source != source_db or row_pathway != pathway_name:
-            continue
-        ecs.update(row_ecs)
-        if reaction_equation and reaction_equation not in reactions:
-            reactions.append(reaction_equation)
-    return tuple(sorted(ecs)), " ; ".join(reactions[:3])
-
-
-def _resolve_kegg_pathway_name(context: PipelineContext, pathway_id: str, fallback: str = "") -> str:
-    """Resolve KEGG map/ath IDs to a readable pathway name."""
-
-    if fallback and not re.fullmatch(r"(?:map|ath)\d{5}", fallback):
-        return fallback
-    if pathway_id.startswith("map"):
-        return context.map_pathways.get(pathway_id, fallback or pathway_id)
-    if pathway_id.startswith("ath"):
-        return context.ath_pathways.get(pathway_id, fallback or pathway_id)
-    return fallback or pathway_id
 
 
 _PMN_PATHWAY_EC_INDEX_CACHE: dict[tuple[str, str], dict[tuple[str, str], set[str]]] = {}
@@ -329,107 +298,10 @@ def _match_chebi_to_pmn(context: PipelineContext) -> dict[str, set[str]]:
     return dict(chebi_to_pmn)
 
 
-def _load_pmn_pathway_rows(path: Path) -> dict[str, list[dict[str, str]]]:
-    """Load PMN pathway files (aracyc/plantcyc) into a pathway_id → rows index."""
-
-    rows_by_pathway: dict[str, list[dict[str, str]]] = defaultdict(list)
-    if not path.exists():
-        return dict(rows_by_pathway)
-    with path.open(encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            pid = row.get("Pathway-id", "")
-            if pid:
-                rows_by_pathway[pid].append(row)
-    return dict(rows_by_pathway)
-
-
-def generate_expanded_candidates(context: PipelineContext) -> list[ExpandedCandidate]:
-    """Generate expanded pathway candidates for compounds without primary pathway hits."""
-
-    # Identify target compounds
-    target_compound_ids: set[str] = set()
-    compounds_with_primary_pathway = {
-        compound_id
-        for compound_id, rows in context.ranked_pathway_rows.items()
-        if rows
-    }
-    for compound_id in context.compounds:
-        if compound_id not in compounds_with_primary_pathway:
-            target_compound_ids.add(compound_id)
-
-    if not target_compound_ids:
-        return []
-
-    # Build PMN matching indexes
-    chebi_to_pmn = _match_chebi_to_pmn(context)
-
-    # Build PMN compound→pathway index from raw records so EC/reaction text is
-    # preserved for pair-level features.
-    pmn_compound_pathways = _build_pmn_compound_pathway_index(context)
-
-    candidates: list[ExpandedCandidate] = []
-    seen_pairs: set[tuple[str, str]] = set()
-
-    total = len(target_compound_ids)
-    for idx, compound_id in enumerate(sorted(target_compound_ids, key=int), 1):
-        compound = context.compounds[compound_id]
-
-        # Source 1: PMN direct compound→pathway links
-        matched_pmn_ids = chebi_to_pmn.get(compound_id, set())
-        for pmn_cid in sorted(matched_pmn_ids):
-            for pathway_name, source_db, ec_numbers, reaction_equation, _record_id in pmn_compound_pathways.get(pmn_cid, []):
-                pair_key = (compound_id, f"{source_db}:{pathway_name}")
-                if pair_key in seen_pairs:
-                    continue
-                seen_pairs.add(pair_key)
-                candidates.append(ExpandedCandidate(
-                    compound_id=compound_id,
-                    chebi_accession=compound.chebi_accession,
-                    chebi_name=compound.name,
-                    pathway_id=f"{source_db}:{pmn_cid}:{pathway_name}",
-                    pathway_name=pathway_name,
-                    pathway_source=source_db,
-                    candidate_origin="pmn_direct",
-                    bridge_method="name_or_xref",
-                    ec_numbers=ec_numbers,
-                    reaction_equation=reaction_equation,
-                ))
-
-        # Source 2: Weak KEGG candidates (rejected by step 2 but with some evidence)
-        ranked = context.ranked_candidates_by_compound.get(compound_id, [])
-        for candidate in ranked[:3]:  # Top 3 rejected candidates
-            if candidate.final_score < 0.50:
-                continue
-            kegg_cid = candidate.kegg_compound_id
-            for pathway_id, pathway_name in context.kegg_to_pathways.get(kegg_cid, []):
-                resolved_pathway_name = _resolve_kegg_pathway_name(context, pathway_id, pathway_name)
-                pair_key = (compound_id, pathway_id)
-                if pair_key in seen_pairs:
-                    continue
-                seen_pairs.add(pair_key)
-                candidates.append(ExpandedCandidate(
-                    compound_id=compound_id,
-                    chebi_accession=compound.chebi_accession,
-                    chebi_name=compound.name,
-                    pathway_id=pathway_id,
-                    pathway_name=resolved_pathway_name,
-                    pathway_source="KEGG",
-                    candidate_origin="weak_kegg",
-                    bridge_method=f"weak_score_{candidate.final_score:.3f}",
-                    ec_numbers=(),
-                    reaction_equation="",
-                ))
-
-        if idx % PROGRESS_EVERY == 0 or idx == total:
-            print(f"  expanded candidate generation: {idx}/{total} compounds, {len(candidates)} candidates", flush=True)
-
-    return candidates
-
-
 # ---------------------------------------------------------------------------
-# 2. Feature extraction
+# Feature extraction
 # ---------------------------------------------------------------------------
+
 
 def _parse_formula(formula: str) -> dict[str, int]:
     """Parse a molecular formula string into element counts."""
@@ -502,6 +374,69 @@ def _is_model_feature(name: str) -> bool:
     if name in MODEL_EXCLUDED_FEATURE_NAMES:
         return False
     return not any(name.startswith(prefix) for prefix in MODEL_EXCLUDED_FEATURE_PREFIXES)
+
+
+def _extract_rdkit_features(structure) -> dict[str, float]:
+    """Extract RDKit molecular descriptors. Returns zeros if RDKit unavailable."""
+
+    defaults = {
+        "rd_MolWt": 0.0,
+        "rd_ExactMolWt": 0.0,
+        "rd_TPSA": 0.0,
+        "rd_MolLogP": 0.0,
+        "rd_NumHDonors": 0.0,
+        "rd_NumHAcceptors": 0.0,
+        "rd_NumRotatableBonds": 0.0,
+        "rd_RingCount": 0.0,
+        "rd_NumAromaticRings": 0.0,
+        "rd_FractionCSP3": 0.0,
+        "rd_HeavyAtomCount": 0.0,
+        "rd_FormalCharge": 0.0,
+        "rd_available": 0.0,
+    }
+    if not structure or not structure.smiles:
+        return defaults
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, rdMolDescriptors
+        mol = Chem.MolFromSmiles(structure.smiles)
+        if mol is None:
+            return defaults
+        return {
+            "rd_MolWt": Descriptors.MolWt(mol),
+            "rd_ExactMolWt": Descriptors.ExactMolWt(mol),
+            "rd_TPSA": Descriptors.TPSA(mol),
+            "rd_MolLogP": Descriptors.MolLogP(mol),
+            "rd_NumHDonors": float(Descriptors.NumHDonors(mol)),
+            "rd_NumHAcceptors": float(Descriptors.NumHAcceptors(mol)),
+            "rd_NumRotatableBonds": float(Descriptors.NumRotatableBonds(mol)),
+            "rd_RingCount": float(Descriptors.RingCount(mol)),
+            "rd_NumAromaticRings": float(rdMolDescriptors.CalcNumAromaticRings(mol)),
+            "rd_FractionCSP3": float(Descriptors.FractionCSP3(mol)),
+            "rd_HeavyAtomCount": float(Descriptors.HeavyAtomCount(mol)),
+            "rd_FormalCharge": float(Chem.GetFormalCharge(mol)),
+            "rd_available": 1.0,
+        }
+    except Exception:
+        return defaults
+
+
+def _extract_morgan_fp(structure, n_bits: int = 256) -> dict[str, float]:
+    """Extract Morgan fingerprint (radius=2) as individual bit features."""
+
+    defaults = {f"mfp_{i}": 0.0 for i in range(n_bits)}
+    if not structure or not structure.smiles:
+        return defaults
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(structure.smiles)
+        if mol is None:
+            return defaults
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
+        return {f"mfp_{i}": float(fp[i]) for i in range(n_bits)}
+    except Exception:
+        return defaults
 
 
 def extract_compound_features(
@@ -580,69 +515,6 @@ def extract_compound_features(
     return features
 
 
-def _extract_rdkit_features(structure) -> dict[str, float]:
-    """Extract RDKit molecular descriptors. Returns zeros if RDKit unavailable."""
-
-    defaults = {
-        "rd_MolWt": 0.0,
-        "rd_ExactMolWt": 0.0,
-        "rd_TPSA": 0.0,
-        "rd_MolLogP": 0.0,
-        "rd_NumHDonors": 0.0,
-        "rd_NumHAcceptors": 0.0,
-        "rd_NumRotatableBonds": 0.0,
-        "rd_RingCount": 0.0,
-        "rd_NumAromaticRings": 0.0,
-        "rd_FractionCSP3": 0.0,
-        "rd_HeavyAtomCount": 0.0,
-        "rd_FormalCharge": 0.0,
-        "rd_available": 0.0,
-    }
-    if not structure or not structure.smiles:
-        return defaults
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import Descriptors, rdMolDescriptors
-        mol = Chem.MolFromSmiles(structure.smiles)
-        if mol is None:
-            return defaults
-        return {
-            "rd_MolWt": Descriptors.MolWt(mol),
-            "rd_ExactMolWt": Descriptors.ExactMolWt(mol),
-            "rd_TPSA": Descriptors.TPSA(mol),
-            "rd_MolLogP": Descriptors.MolLogP(mol),
-            "rd_NumHDonors": float(Descriptors.NumHDonors(mol)),
-            "rd_NumHAcceptors": float(Descriptors.NumHAcceptors(mol)),
-            "rd_NumRotatableBonds": float(Descriptors.NumRotatableBonds(mol)),
-            "rd_RingCount": float(Descriptors.RingCount(mol)),
-            "rd_NumAromaticRings": float(rdMolDescriptors.CalcNumAromaticRings(mol)),
-            "rd_FractionCSP3": float(Descriptors.FractionCSP3(mol)),
-            "rd_HeavyAtomCount": float(Descriptors.HeavyAtomCount(mol)),
-            "rd_FormalCharge": float(Chem.GetFormalCharge(mol)),
-            "rd_available": 1.0,
-        }
-    except Exception:
-        return defaults
-
-
-def _extract_morgan_fp(structure, n_bits: int = 256) -> dict[str, float]:
-    """Extract Morgan fingerprint (radius=2) as individual bit features."""
-
-    defaults = {f"mfp_{i}": 0.0 for i in range(n_bits)}
-    if not structure or not structure.smiles:
-        return defaults
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
-        mol = Chem.MolFromSmiles(structure.smiles)
-        if mol is None:
-            return defaults
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=n_bits)
-        return {f"mfp_{i}": float(fp[i]) for i in range(n_bits)}
-    except Exception:
-        return defaults
-
-
 def extract_pair_features(
     compound_id: str,
     candidate: ExpandedCandidate,
@@ -684,7 +556,7 @@ def extract_pair_features(
         features["pw_gene_count"] = float(context.ath_gene_counts.get(ath_id, 0)) if ath_id else 0.0
         features["pw_pathway_id_count"] = 0.0
 
-    # Plant Reactome alignment — check if any reactome pathway name matches
+    # Plant Reactome alignment
     pr_match = 0.0
     pw_tokens = _pathway_category_tokens(candidate.pathway_name)
     for pr_id, pr_info in context.plant_reactome_pathways.items():
@@ -704,283 +576,9 @@ def extract_pair_features(
 
 
 # ---------------------------------------------------------------------------
-# 3. Training set construction
+# Model helpers
 # ---------------------------------------------------------------------------
 
-def build_training_set(
-    context: PipelineContext,
-    compound_feature_cache: dict[str, dict[str, float]],
-) -> tuple[list[dict[str, float]], list[int], list[dict[str, str]]]:
-    """Build positive and negative compound-pathway pairs from the primary chain.
-
-    Positive: primary chain hits with score >= 0.70
-    Negative: hard negatives (same compound, pathway not hit) + random negatives
-    """
-
-    positives: list[TrainingPair] = []
-    positive_set: set[tuple[str, str]] = set()
-    positive_by_compound: defaultdict[str, set[str]] = defaultdict(set)
-    pmn_index = _build_pmn_compound_pathway_index(context)
-
-    def add_positive(pair: TrainingPair) -> None:
-        normalized = normalize_name(pair.pathway_name)
-        if not normalized:
-            return
-        key = (pair.compound_id, normalized)
-        if key in positive_set:
-            return
-        positives.append(pair)
-        positive_set.add(key)
-        positive_by_compound[pair.compound_id].add(normalized)
-
-    # Collect positive samples from primary chain high-confidence hits
-    for compound_id, rows in context.ranked_pathway_rows.items():
-        for row in rows:
-            if row.score >= 0.70:
-                add_positive(
-                    TrainingPair(
-                        compound_id=compound_id,
-                        pathway_name=row.pathway_name or _resolve_kegg_pathway_name(context, row.map_pathway_id),
-                        pathway_source="KEGG",
-                        candidate_origin="primary_kegg",
-                        label_source="primary_chain_score_ge_0.70",
-                    )
-                )
-
-    # Also add strong PMN direct matches as positives
-    for compound_id, cc in context.compound_contexts.items():
-        for pmn_record_id in cc.matched_plantcyc_methods:
-            record = context.plantcyc_records.get(pmn_record_id)
-            if not record:
-                continue
-            # Only if bridge was established (high confidence PMN link)
-            bridges = context.plant_to_kegg_bridge_rows_by_compound.get(compound_id, [])
-            if not bridges:
-                continue
-            for pathway in record.pathways:
-                ec_numbers, reaction_equation = _lookup_pmn_reaction_context(
-                    pmn_index,
-                    source_db=record.source_db,
-                    pmn_compound_id=record.compound_id,
-                    pathway_name=pathway,
-                )
-                add_positive(
-                    TrainingPair(
-                        compound_id=compound_id,
-                        pathway_name=pathway,
-                        pathway_source=record.source_db,
-                        candidate_origin="pmn_direct",
-                        label_source="pmn_direct_with_kegg_bridge",
-                        ec_numbers=ec_numbers,
-                        reaction_equation=reaction_equation,
-                    )
-                )
-
-    if not positives:
-        return [], [], []
-
-    # Collect all available pathway names for negative sampling
-    pathway_catalog_by_source: defaultdict[str, list[TrainingPair]] = defaultdict(list)
-    pathway_catalog_seen: set[tuple[str, str]] = set()
-
-    def add_catalog_entry(entry: TrainingPair) -> None:
-        normalized = normalize_name(entry.pathway_name)
-        if not normalized:
-            return
-        key = (entry.pathway_source, normalized)
-        if key in pathway_catalog_seen:
-            return
-        pathway_catalog_seen.add(key)
-        pathway_catalog_by_source[entry.pathway_source].append(entry)
-
-    for _pmn_cid, rows in pmn_index.items():
-        for pathway_name, source_db, ec_numbers, reaction_equation, _record_id in rows:
-            add_catalog_entry(
-                TrainingPair(
-                    compound_id="",
-                    pathway_name=pathway_name,
-                    pathway_source=source_db,
-                    candidate_origin="pmn_direct",
-                    label_source="negative_pool",
-                    ec_numbers=ec_numbers,
-                    reaction_equation=reaction_equation,
-                )
-            )
-    for pathways in context.kegg_to_pathways.values():
-        for pathway_id, pathway_name in pathways:
-            add_catalog_entry(
-                TrainingPair(
-                    compound_id="",
-                    pathway_name=_resolve_kegg_pathway_name(context, pathway_id, pathway_name),
-                    pathway_source="KEGG",
-                    candidate_origin="weak_kegg",
-                    label_source="negative_pool",
-                )
-            )
-    for pathway_id, pathway_name in context.map_pathways.items():
-        add_catalog_entry(
-            TrainingPair(
-                compound_id="",
-                pathway_name=_resolve_kegg_pathway_name(context, pathway_id, pathway_name),
-                pathway_source="KEGG",
-                candidate_origin="weak_kegg",
-                label_source="negative_pool",
-            )
-        )
-
-    all_catalog_entries = [
-        entry
-        for entries in pathway_catalog_by_source.values()
-        for entry in entries
-    ]
-
-    rng = np.random.RandomState(RANDOM_SEED)
-
-    # Build negative samples
-    negatives: list[TrainingPair] = []
-    negative_seen: set[tuple[str, str, str]] = set()
-
-    def add_negative(compound_id: str, entry: TrainingPair, label_source: str) -> None:
-        normalized = normalize_name(entry.pathway_name)
-        if not normalized or normalized in positive_by_compound.get(compound_id, set()):
-            return
-        key = (compound_id, entry.pathway_source, normalized)
-        if key in negative_seen:
-            return
-        negative_seen.add(key)
-        negatives.append(
-            TrainingPair(
-                compound_id=compound_id,
-                pathway_name=entry.pathway_name,
-                pathway_source=entry.pathway_source,
-                candidate_origin=entry.candidate_origin,
-                label_source=label_source,
-                ec_numbers=entry.ec_numbers,
-                reaction_equation=entry.reaction_equation,
-            )
-        )
-
-    # Hard negatives: for each positive compound, pick pathways that were NOT hits
-    for pair in positives:
-        pool = pathway_catalog_by_source.get(pair.pathway_source) or all_catalog_entries
-        if not pool:
-            continue
-        attempts = 0
-        added = 0
-        while added < 2 and attempts < 50:
-            attempts += 1
-            entry = pool[int(rng.randint(len(pool)))]
-            before = len(negatives)
-            add_negative(pair.compound_id, entry, "hard_negative_same_source")
-            if len(negatives) > before:
-                added += 1
-
-    # Also add rejected weak KEGG candidates as negatives
-    def compound_sort_key(value: str) -> tuple[int, object]:
-        return (0, int(value)) if value.isdigit() else (1, value)
-
-    for cid in sorted(positive_by_compound, key=compound_sort_key)[:500]:
-        ranked = context.ranked_candidates_by_compound.get(cid, [])
-        selected = context.selected_by_compound.get(cid, [])
-        selected_kegg_ids = {m.kegg_compound_id for m in selected}
-        for candidate in ranked:
-            if candidate.kegg_compound_id in selected_kegg_ids:
-                continue
-            if candidate.final_score < 0.30:
-                continue
-            for pathway_id, pathway_name in context.kegg_to_pathways.get(candidate.kegg_compound_id, []):
-                add_negative(
-                    cid,
-                    TrainingPair(
-                        compound_id="",
-                        pathway_name=_resolve_kegg_pathway_name(context, pathway_id, pathway_name),
-                        pathway_source="KEGG",
-                        candidate_origin="weak_kegg",
-                        label_source="rejected_weak_kegg",
-                    ),
-                    "rejected_weak_kegg",
-                )
-                break
-
-    # Balance: keep at most 3x negatives per positive
-    max_neg = len(positives) * 3
-    if len(negatives) > max_neg:
-        indices = rng.choice(len(negatives), size=max_neg, replace=False)
-        negatives = [negatives[i] for i in indices]
-
-    # Extract features for all pairs
-    all_features: list[dict[str, float]] = []
-    all_labels: list[int] = []
-    all_metadata: list[dict[str, str]] = []
-
-    for pair in positives:
-        compound_id = pair.compound_id
-        if compound_id not in compound_feature_cache:
-            compound_feature_cache[compound_id] = extract_compound_features(compound_id, context)
-        cf = compound_feature_cache[compound_id]
-
-        dummy_candidate = ExpandedCandidate(
-            compound_id=compound_id,
-            chebi_accession=context.compounds[compound_id].chebi_accession,
-            chebi_name=context.compounds[compound_id].name,
-            pathway_id=f"train:{pair.pathway_name}",
-            pathway_name=pair.pathway_name,
-            pathway_source=pair.pathway_source,
-            candidate_origin=pair.candidate_origin,
-            bridge_method="training_positive",
-            ec_numbers=pair.ec_numbers,
-            reaction_equation=pair.reaction_equation,
-        )
-        pf = extract_pair_features(compound_id, dummy_candidate, cf, context)
-        merged = {**cf, **pf}
-        all_features.append(merged)
-        all_labels.append(1)
-        all_metadata.append({
-            "compound_id": compound_id,
-            "pathway_name": pair.pathway_name,
-            "label": "positive",
-            "label_source": pair.label_source,
-            "pathway_source": pair.pathway_source,
-            "candidate_origin": pair.candidate_origin,
-        })
-
-    for pair in negatives:
-        compound_id = pair.compound_id
-        if compound_id not in compound_feature_cache:
-            compound_feature_cache[compound_id] = extract_compound_features(compound_id, context)
-        cf = compound_feature_cache[compound_id]
-
-        dummy_candidate = ExpandedCandidate(
-            compound_id=compound_id,
-            chebi_accession=context.compounds[compound_id].chebi_accession,
-            chebi_name=context.compounds[compound_id].name,
-            pathway_id=f"train_neg:{pair.pathway_name}",
-            pathway_name=pair.pathway_name,
-            pathway_source=pair.pathway_source,
-            candidate_origin=pair.candidate_origin,
-            bridge_method="training_negative",
-            ec_numbers=pair.ec_numbers,
-            reaction_equation=pair.reaction_equation,
-        )
-        pf = extract_pair_features(compound_id, dummy_candidate, cf, context)
-        merged = {**cf, **pf}
-        all_features.append(merged)
-        all_labels.append(0)
-        all_metadata.append({
-            "compound_id": compound_id,
-            "pathway_name": pair.pathway_name,
-            "label": "negative",
-            "label_source": pair.label_source,
-            "pathway_source": pair.pathway_source,
-            "candidate_origin": pair.candidate_origin,
-        })
-
-    return all_features, all_labels, all_metadata
-
-
-# ---------------------------------------------------------------------------
-# 4. Model training + prediction
-# ---------------------------------------------------------------------------
 
 def _features_to_matrix(feature_dicts: list[dict[str, float]], feature_names: list[str]) -> np.ndarray:
     """Convert a list of feature dicts to a numpy matrix using a fixed column order."""
@@ -989,201 +587,13 @@ def _features_to_matrix(feature_dicts: list[dict[str, float]], feature_names: li
     for i, fd in enumerate(feature_dicts):
         for j, name in enumerate(feature_names):
             matrix[i, j] = fd.get(name, 0.0)
-    # Replace NaN/Inf with 0
     matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
     return matrix
 
 
-def train_and_predict(
-    train_features: list[dict[str, float]],
-    train_labels: list[int],
-    train_metadata: list[dict[str, str]],
-    predict_features: list[dict[str, float]],
-    context: PipelineContext,
-) -> tuple[np.ndarray, dict[str, object]]:
-    """Train LogisticRegression on training pairs, predict on expanded candidates.
-
-    Returns (predicted_probabilities, model_metadata).
-    """
-
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import GroupKFold, cross_val_score
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import roc_auc_score, precision_score, recall_score
-    import joblib
-
-    if not train_features:
-        return np.array([]), {}
-
-    # Determine feature names from union of all training feature dicts, then
-    # remove source/origin/metadata leakage features before model fitting.
-    all_feature_names = sorted(set().union(*(fd.keys() for fd in train_features)))
-    feature_names = [name for name in all_feature_names if _is_model_feature(name)]
-    excluded_feature_names = [name for name in all_feature_names if name not in feature_names]
-    if not feature_names:
-        return np.array([]), {"status": "skipped", "reason": "no non-leakage model features"}
-
-    X_train = _features_to_matrix(train_features, feature_names)
-    y_train = np.array(train_labels, dtype=np.int32)
-    groups = np.array([meta.get("compound_id", str(i)) for i, meta in enumerate(train_metadata)])
-    unique_groups = np.unique(groups)
-
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-
-    # Train model
-    model = LogisticRegression(
-        C=1.0,
-        max_iter=1000,
-        random_state=RANDOM_SEED,
-        solver="lbfgs",
-        class_weight="balanced",
-    )
-
-    # Cross-validation for metrics. Use group CV so one compound cannot appear
-    # in both train and validation folds.
-    cv_scores = np.array([])
-    cv_strategy = "skipped"
-    n_splits = min(5, len(unique_groups))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        if n_splits >= 2 and len(set(y_train)) > 1:
-            cv_model = make_pipeline(
-                StandardScaler(),
-                LogisticRegression(
-                    C=1.0,
-                    max_iter=1000,
-                    random_state=RANDOM_SEED,
-                    solver="lbfgs",
-                    class_weight="balanced",
-                ),
-            )
-            try:
-                from sklearn.model_selection import StratifiedGroupKFold
-
-                cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-                cv_strategy = "StratifiedGroupKFold"
-            except ImportError:
-                cv = GroupKFold(n_splits=n_splits)
-                cv_strategy = "GroupKFold"
-            try:
-                raw_cv_scores = cross_val_score(cv_model, X_train, y_train, groups=groups, cv=cv, scoring="roc_auc")
-                cv_scores = raw_cv_scores[np.isfinite(raw_cv_scores)]
-                if len(cv_scores) == 0:
-                    cv_strategy = f"{cv_strategy}_no_finite_scores"
-            except ValueError as exc:
-                cv_strategy = f"{cv_strategy}_failed:{exc.__class__.__name__}"
-
-    # Fit on full training set
-    model.fit(X_train_scaled, y_train)
-
-    # Training set metrics
-    y_train_pred = model.predict(X_train_scaled)
-    y_train_prob = model.predict_proba(X_train_scaled)[:, 1]
-    train_auc = roc_auc_score(y_train, y_train_prob) if len(set(y_train)) > 1 else 0.0
-    train_precision = precision_score(y_train, y_train_pred, zero_division=0.0)
-    train_recall = recall_score(y_train, y_train_pred, zero_division=0.0)
-
-    # Predict on expanded candidates
-    if predict_features:
-        X_pred = _features_to_matrix(predict_features, feature_names)
-        X_pred_scaled = scaler.transform(X_pred)
-        pred_probs = model.predict_proba(X_pred_scaled)[:, 1]
-    else:
-        pred_probs = np.array([])
-
-    # Save model
-    model_dir = context.paths.ml_model_path.parent
-    model_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "scaler": scaler, "feature_names": feature_names}, context.paths.ml_model_path)
-
-    # Top feature importances
-    coef = model.coef_[0]
-    top_positive_idx = np.argsort(coef)[-10:][::-1]
-    top_negative_idx = np.argsort(coef)[:10]
-    top_positive_features = [(feature_names[i], round(float(coef[i]), 4)) for i in top_positive_idx]
-    top_negative_features = [(feature_names[i], round(float(coef[i]), 4)) for i in top_negative_idx]
-    leakage_feature_names = [
-        name
-        for name in feature_names
-        if name.startswith(("source_", "origin_")) or "negative" in name.lower()
-    ]
-    score_distribution = {
-        "min": round(float(np.min(pred_probs)), 4) if len(pred_probs) else 0.0,
-        "p50": round(float(np.percentile(pred_probs, 50)), 4) if len(pred_probs) else 0.0,
-        "p90": round(float(np.percentile(pred_probs, 90)), 4) if len(pred_probs) else 0.0,
-        "p95": round(float(np.percentile(pred_probs, 95)), 4) if len(pred_probs) else 0.0,
-        "p99": round(float(np.percentile(pred_probs, 99)), 4) if len(pred_probs) else 0.0,
-        "max": round(float(np.max(pred_probs)), 4) if len(pred_probs) else 0.0,
-        "mean": round(float(np.mean(pred_probs)), 4) if len(pred_probs) else 0.0,
-    }
-
-    metadata = {
-        "model_version": MODEL_VERSION,
-        "feature_set_version": FEATURE_SET_VERSION,
-        "model_type": "LogisticRegression",
-        "feature_count": len(feature_names),
-        "raw_feature_count": len(all_feature_names),
-        "excluded_model_feature_count": len(excluded_feature_names),
-        "excluded_model_features": excluded_feature_names,
-        "training_samples": len(train_labels),
-        "positive_samples": int(sum(train_labels)),
-        "negative_samples": int(len(train_labels) - sum(train_labels)),
-        "cv_strategy": cv_strategy,
-        "cv_group_count": int(len(unique_groups)),
-        "cv_roc_auc_mean": round(float(np.mean(cv_scores)), 4) if len(cv_scores) else 0.0,
-        "cv_roc_auc_std": round(float(np.std(cv_scores)), 4) if len(cv_scores) else 0.0,
-        "train_roc_auc": round(float(train_auc), 4),
-        "train_precision": round(float(train_precision), 4),
-        "train_recall": round(float(train_recall), 4),
-        "ml_score_threshold": ML_SCORE_THRESHOLD,
-        "expanded_candidates_scored": len(predict_features),
-        "expanded_candidates_above_threshold": int(np.sum(pred_probs >= ML_SCORE_THRESHOLD)) if len(pred_probs) > 0 else 0,
-        "score_distribution": score_distribution,
-        "score_calibration_warning": bool(len(pred_probs) > 0 and np.all(pred_probs >= ML_SCORE_THRESHOLD)),
-        "leakage_features_in_model": leakage_feature_names,
-        "top_positive_features": top_positive_features,
-        "top_negative_features": top_negative_features,
-        "random_seed": RANDOM_SEED,
-        "morgan_fp_bits": 256,
-    }
-
-    return pred_probs, metadata
-
-
 # ---------------------------------------------------------------------------
-# 5. Output writing
+# Output writers
 # ---------------------------------------------------------------------------
-
-EXPANDED_CANDIDATE_FIELDS = [
-    "compound_id",
-    "chebi_accession",
-    "chebi_name",
-    "pathway_id",
-    "pathway_name",
-    "pathway_source",
-    "candidate_origin",
-    "bridge_method",
-    "ec_numbers",
-    "reaction_equation",
-]
-
-ML_PREDICTION_FIELDS = [
-    "compound_id",
-    "chebi_accession",
-    "chebi_name",
-    "pathway_id",
-    "pathway_name",
-    "pathway_source",
-    "candidate_origin",
-    "ml_score",
-    "ml_confidence",
-    "is_expanded_candidate",
-    "bridge_method",
-    "reason",
-]
 
 
 def write_expanded_candidates(context: PipelineContext, candidates: list[ExpandedCandidate]) -> int:
@@ -1282,42 +692,411 @@ def write_ml_predictions(
 
 
 # ---------------------------------------------------------------------------
-# 6. Main step orchestration
+# 1. Candidate generation (AraCyc-first version)
 # ---------------------------------------------------------------------------
 
+
+def generate_aracyc_expanded_candidates(
+    context: PipelineContext,
+) -> list[ExpandedCandidate]:
+    """Generate expanded candidates for compounds without AraCyc primary pathway hits.
+
+    Sources:
+    1. PlantCyc direct compound→pathway links
+    2. Structural similarity neighbors with known pathways
+    """
+    # Identify target compounds (no AraCyc pathway hits)
+    compounds_with_primary = {
+        cid for cid, rows in context.aracyc_ranked_rows.items() if rows
+    }
+    target_compound_ids = set(context.compounds.keys()) - compounds_with_primary
+
+    if not target_compound_ids:
+        return []
+
+    # Build PMN matching indexes
+    chebi_to_pmn = _match_chebi_to_pmn(context)
+    pmn_compound_pathways = _build_pmn_compound_pathway_index(context)
+
+    candidates: list[ExpandedCandidate] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    total = len(target_compound_ids)
+    for idx, compound_id in enumerate(sorted(target_compound_ids, key=int), 1):
+        compound = context.compounds[compound_id]
+
+        # Source 1: PlantCyc/AraCyc direct compound→pathway links
+        matched_pmn_ids = chebi_to_pmn.get(compound_id, set())
+        for pmn_cid in sorted(matched_pmn_ids):
+            for pathway_name, source_db, ec_numbers, reaction_equation, _record_id in pmn_compound_pathways.get(pmn_cid, []):
+                pair_key = (compound_id, f"{source_db}:{pathway_name}")
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                candidates.append(ExpandedCandidate(
+                    compound_id=compound_id,
+                    chebi_accession=compound.chebi_accession,
+                    chebi_name=compound.name,
+                    pathway_id=f"{source_db}:{pmn_cid}:{pathway_name}",
+                    pathway_name=pathway_name,
+                    pathway_source=source_db,
+                    candidate_origin="pmn_direct",
+                    bridge_method="name_or_xref",
+                    ec_numbers=ec_numbers,
+                    reaction_equation=reaction_equation,
+                ))
+
+        if idx % PROGRESS_EVERY == 0 or idx == total:
+            print(f"    expanded candidate generation: {idx}/{total} compounds, {len(candidates)} candidates", flush=True)
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# 2. Training set construction (AraCyc-first version)
+# ---------------------------------------------------------------------------
+
+
+def build_aracyc_training_set(
+    context: PipelineContext,
+    compound_feature_cache: dict[str, dict[str, float]],
+) -> tuple[list[dict[str, float]], list[int], list[dict[str, str]]]:
+    """Build training pairs from AraCyc primary chain.
+
+    Positive: AraCyc primary chain hits with score >= 0.50
+    Negative: hard negatives (same compound, pathway not hit) + random
+    """
+    positives: list[TrainingPair] = []
+    positive_set: set[tuple[str, str]] = set()
+    positive_by_compound: defaultdict[str, set[str]] = defaultdict(set)
+    pmn_index = _build_pmn_compound_pathway_index(context)
+
+    def add_positive(pair: TrainingPair) -> None:
+        normalized = normalize_name(pair.pathway_name)
+        if not normalized:
+            return
+        key = (pair.compound_id, normalized)
+        if key in positive_set:
+            return
+        positives.append(pair)
+        positive_set.add(key)
+        positive_by_compound[pair.compound_id].add(normalized)
+
+    # Collect positives from AraCyc primary chain
+    for compound_id, rows in context.aracyc_ranked_rows.items():
+        for row in rows:
+            if row.score >= 0.50:
+                add_positive(TrainingPair(
+                    compound_id=compound_id,
+                    pathway_name=row.pathway_name,
+                    pathway_source=row.source_db,
+                    candidate_origin="primary_aracyc",
+                    label_source="aracyc_primary_score_ge_0.50",
+                ))
+
+    if not positives:
+        return [], [], []
+
+    # Build pathway catalog for negative sampling
+    pathway_catalog: list[TrainingPair] = []
+    pathway_catalog_seen: set[tuple[str, str]] = set()
+
+    for _pmn_cid, rows in pmn_index.items():
+        for pathway_name, source_db, ec_numbers, reaction_equation, _record_id in rows:
+            normalized = normalize_name(pathway_name)
+            key = (source_db, normalized)
+            if key in pathway_catalog_seen or not normalized:
+                continue
+            pathway_catalog_seen.add(key)
+            pathway_catalog.append(TrainingPair(
+                compound_id="",
+                pathway_name=pathway_name,
+                pathway_source=source_db,
+                candidate_origin="pmn_direct",
+                label_source="negative_pool",
+                ec_numbers=ec_numbers,
+                reaction_equation=reaction_equation,
+            ))
+
+    rng = np.random.RandomState(RANDOM_SEED)
+    negatives: list[TrainingPair] = []
+    negative_seen: set[tuple[str, str, str]] = set()
+
+    def add_negative(compound_id: str, entry: TrainingPair, label_source: str) -> None:
+        normalized = normalize_name(entry.pathway_name)
+        if not normalized or normalized in positive_by_compound.get(compound_id, set()):
+            return
+        key = (compound_id, entry.pathway_source, normalized)
+        if key in negative_seen:
+            return
+        negative_seen.add(key)
+        negatives.append(TrainingPair(
+            compound_id=compound_id,
+            pathway_name=entry.pathway_name,
+            pathway_source=entry.pathway_source,
+            candidate_origin=entry.candidate_origin,
+            label_source=label_source,
+            ec_numbers=entry.ec_numbers,
+            reaction_equation=entry.reaction_equation,
+        ))
+
+    # Hard negatives: for each positive compound, pick random pathways not hit
+    for pair in positives:
+        if not pathway_catalog:
+            break
+        attempts = 0
+        added = 0
+        while added < 2 and attempts < 50:
+            attempts += 1
+            entry = pathway_catalog[int(rng.randint(len(pathway_catalog)))]
+            before = len(negatives)
+            add_negative(pair.compound_id, entry, "hard_negative")
+            if len(negatives) > before:
+                added += 1
+
+    # Balance: keep at most 3x negatives per positive
+    max_neg = len(positives) * 3
+    if len(negatives) > max_neg:
+        indices = rng.choice(len(negatives), size=max_neg, replace=False)
+        negatives = [negatives[i] for i in indices]
+
+    # Extract features
+    all_features: list[dict[str, float]] = []
+    all_labels: list[int] = []
+    all_metadata: list[dict[str, str]] = []
+
+    for pair in positives:
+        cid = pair.compound_id
+        if cid not in compound_feature_cache:
+            compound_feature_cache[cid] = extract_compound_features(cid, context)
+        cf = compound_feature_cache[cid]
+        dummy = ExpandedCandidate(
+            compound_id=cid,
+            chebi_accession=context.compounds[cid].chebi_accession,
+            chebi_name=context.compounds[cid].name,
+            pathway_id=f"train:{pair.pathway_name}",
+            pathway_name=pair.pathway_name,
+            pathway_source=pair.pathway_source,
+            candidate_origin=pair.candidate_origin,
+            bridge_method="training_positive",
+            ec_numbers=pair.ec_numbers,
+            reaction_equation=pair.reaction_equation,
+        )
+        pf = extract_pair_features(cid, dummy, cf, context)
+        all_features.append({**cf, **pf})
+        all_labels.append(1)
+        all_metadata.append({
+            "compound_id": cid,
+            "pathway_name": pair.pathway_name,
+            "label": "positive",
+            "label_source": pair.label_source,
+            "pathway_source": pair.pathway_source,
+            "candidate_origin": pair.candidate_origin,
+        })
+
+    for pair in negatives:
+        cid = pair.compound_id
+        if cid not in compound_feature_cache:
+            compound_feature_cache[cid] = extract_compound_features(cid, context)
+        cf = compound_feature_cache[cid]
+        dummy = ExpandedCandidate(
+            compound_id=cid,
+            chebi_accession=context.compounds[cid].chebi_accession,
+            chebi_name=context.compounds[cid].name,
+            pathway_id=f"train_neg:{pair.pathway_name}",
+            pathway_name=pair.pathway_name,
+            pathway_source=pair.pathway_source,
+            candidate_origin=pair.candidate_origin,
+            bridge_method="training_negative",
+            ec_numbers=pair.ec_numbers,
+            reaction_equation=pair.reaction_equation,
+        )
+        pf = extract_pair_features(cid, dummy, cf, context)
+        all_features.append({**cf, **pf})
+        all_labels.append(0)
+        all_metadata.append({
+            "compound_id": cid,
+            "pathway_name": pair.pathway_name,
+            "label": "negative",
+            "label_source": pair.label_source,
+            "pathway_source": pair.pathway_source,
+            "candidate_origin": pair.candidate_origin,
+        })
+
+    return all_features, all_labels, all_metadata
+
+
+# ---------------------------------------------------------------------------
+# 3. Model training + prediction
+# ---------------------------------------------------------------------------
+
+
+def train_and_predict_aracyc(
+    train_features: list[dict[str, float]],
+    train_labels: list[int],
+    train_metadata: list[dict[str, str]],
+    predict_features: list[dict[str, float]],
+    context: PipelineContext,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Train and predict using LogisticRegression with group-aware CV."""
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GroupKFold, cross_val_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_auc_score, precision_score, recall_score
+    import joblib
+
+    if not train_features:
+        return np.array([]), {}
+
+    all_feature_names = sorted(set().union(*(fd.keys() for fd in train_features)))
+    feature_names = [name for name in all_feature_names if _is_model_feature(name)]
+    excluded_feature_names = [name for name in all_feature_names if name not in feature_names]
+    if not feature_names:
+        return np.array([]), {"status": "skipped", "reason": "no model features"}
+
+    X_train = _features_to_matrix(train_features, feature_names)
+    y_train = np.array(train_labels, dtype=np.int32)
+    groups = np.array([meta.get("compound_id", str(i)) for i, meta in enumerate(train_metadata)])
+    unique_groups = np.unique(groups)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+
+    model = LogisticRegression(
+        C=1.0, max_iter=1000, random_state=RANDOM_SEED,
+        solver="lbfgs", class_weight="balanced",
+    )
+
+    # Cross-validation
+    cv_scores = np.array([])
+    cv_strategy = "skipped"
+    n_splits = min(5, len(unique_groups))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if n_splits >= 2 and len(set(y_train)) > 1:
+            cv_model = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(C=1.0, max_iter=1000, random_state=RANDOM_SEED, solver="lbfgs", class_weight="balanced"),
+            )
+            try:
+                from sklearn.model_selection import StratifiedGroupKFold
+                cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+                cv_strategy = "StratifiedGroupKFold"
+            except ImportError:
+                cv = GroupKFold(n_splits=n_splits)
+                cv_strategy = "GroupKFold"
+            try:
+                raw_cv_scores = cross_val_score(cv_model, X_train, y_train, groups=groups, cv=cv, scoring="roc_auc")
+                cv_scores = raw_cv_scores[np.isfinite(raw_cv_scores)]
+            except ValueError:
+                cv_strategy = f"{cv_strategy}_failed"
+
+    model.fit(X_train_scaled, y_train)
+
+    y_train_pred = model.predict(X_train_scaled)
+    y_train_prob = model.predict_proba(X_train_scaled)[:, 1]
+    train_auc = roc_auc_score(y_train, y_train_prob) if len(set(y_train)) > 1 else 0.0
+    train_precision = precision_score(y_train, y_train_pred, zero_division=0.0)
+    train_recall = recall_score(y_train, y_train_pred, zero_division=0.0)
+
+    if predict_features:
+        X_pred = _features_to_matrix(predict_features, feature_names)
+        X_pred_scaled = scaler.transform(X_pred)
+        pred_probs = model.predict_proba(X_pred_scaled)[:, 1]
+    else:
+        pred_probs = np.array([])
+
+    # Save model
+    model_dir = context.paths.ml_model_path.parent
+    model_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"model": model, "scaler": scaler, "feature_names": feature_names}, context.paths.ml_model_path)
+
+    # Feature importances
+    coef = model.coef_[0]
+    top_positive_idx = np.argsort(coef)[-10:][::-1]
+    top_negative_idx = np.argsort(coef)[:10]
+    top_positive_features = [(feature_names[i], round(float(coef[i]), 4)) for i in top_positive_idx]
+    top_negative_features = [(feature_names[i], round(float(coef[i]), 4)) for i in top_negative_idx]
+
+    score_distribution = {
+        "min": round(float(np.min(pred_probs)), 4) if len(pred_probs) else 0.0,
+        "p50": round(float(np.percentile(pred_probs, 50)), 4) if len(pred_probs) else 0.0,
+        "p90": round(float(np.percentile(pred_probs, 90)), 4) if len(pred_probs) else 0.0,
+        "p95": round(float(np.percentile(pred_probs, 95)), 4) if len(pred_probs) else 0.0,
+        "p99": round(float(np.percentile(pred_probs, 99)), 4) if len(pred_probs) else 0.0,
+        "max": round(float(np.max(pred_probs)), 4) if len(pred_probs) else 0.0,
+        "mean": round(float(np.mean(pred_probs)), 4) if len(pred_probs) else 0.0,
+    }
+
+    metadata = {
+        "model_version": MODEL_VERSION,
+        "feature_set_version": FEATURE_SET_VERSION,
+        "model_type": "LogisticRegression",
+        "feature_count": len(feature_names),
+        "raw_feature_count": len(all_feature_names),
+        "excluded_model_feature_count": len(excluded_feature_names),
+        "excluded_model_features": excluded_feature_names,
+        "training_samples": len(train_labels),
+        "positive_samples": int(sum(train_labels)),
+        "negative_samples": int(len(train_labels) - sum(train_labels)),
+        "cv_strategy": cv_strategy,
+        "cv_group_count": int(len(unique_groups)),
+        "cv_roc_auc_mean": round(float(np.mean(cv_scores)), 4) if len(cv_scores) else 0.0,
+        "cv_roc_auc_std": round(float(np.std(cv_scores)), 4) if len(cv_scores) else 0.0,
+        "train_roc_auc": round(float(train_auc), 4),
+        "train_precision": round(float(train_precision), 4),
+        "train_recall": round(float(train_recall), 4),
+        "ml_score_threshold": ML_SCORE_THRESHOLD,
+        "expanded_candidates_scored": len(predict_features),
+        "expanded_candidates_above_threshold": int(np.sum(pred_probs >= ML_SCORE_THRESHOLD)) if len(pred_probs) > 0 else 0,
+        "score_distribution": score_distribution,
+        "score_calibration_warning": bool(len(pred_probs) > 0 and np.all(pred_probs >= ML_SCORE_THRESHOLD)),
+        "leakage_features_in_model": [n for n in feature_names if n.startswith(("source_", "origin_"))],
+        "top_positive_features": top_positive_features,
+        "top_negative_features": top_negative_features,
+        "random_seed": RANDOM_SEED,
+        "morgan_fp_bits": 256,
+    }
+
+    return pred_probs, metadata
+
+
+# ---------------------------------------------------------------------------
+# 4. Step runner
+# ---------------------------------------------------------------------------
+
+
 def run(context: PipelineContext) -> PipelineContext:
-    """Run the full expanded recall pipeline: candidates → features → ML → output."""
+    """Run AraCyc-first ML supplemental recall pipeline."""
 
-    print("Step 8: Expanded recall — generating candidates...", flush=True)
+    print("  Step 6a: ML expanded recall — generating candidates...", flush=True)
 
-    # 1. Generate expanded candidates
-    candidates = generate_expanded_candidates(context)
+    # 1. Generate candidates
+    candidates = generate_aracyc_expanded_candidates(context)
     n_candidates = write_expanded_candidates(context, candidates)
-    print(f"  Generated {n_candidates} expanded candidates for {len(set(c.compound_id for c in candidates))} compounds", flush=True)
+    print(f"    Generated {n_candidates} expanded candidates", flush=True)
     context.expanded_candidates_count = n_candidates
 
     if not candidates:
-        context.add_note("Step 8: no expanded candidates generated — all compounds may already have primary pathway coverage.")
+        context.add_note("Step 6a: no expanded candidates — all compounds may have primary coverage.")
         context.ml_predictions_count = 0
-        # Write empty prediction file
         write_ml_predictions(context, [], np.array([]))
         with context.paths.ml_model_metadata_path.open("w", encoding="utf-8") as handle:
             json.dump({"status": "skipped", "reason": "no expanded candidates"}, handle, indent=2)
         return context
 
-    # 2. Extract compound features (cached for reuse across pairs)
-    print("  Extracting compound features...", flush=True)
+    # 2. Build training set from AraCyc primary chain
+    print("    Building training set from AraCyc primary chain...", flush=True)
     compound_feature_cache: dict[str, dict[str, float]] = {}
-
-    # 3. Build training set from primary chain
-    print("  Building training set from primary chain...", flush=True)
-    train_features, train_labels, train_metadata = build_training_set(context, compound_feature_cache)
+    train_features, train_labels, train_metadata = build_aracyc_training_set(context, compound_feature_cache)
     write_ml_training_pairs(context, train_metadata, train_labels)
-    print(f"  Training set: {sum(train_labels)} positive, {len(train_labels) - sum(train_labels)} negative pairs", flush=True)
+    n_pos = sum(train_labels)
+    print(f"    Training set: {n_pos} positive, {len(train_labels) - n_pos} negative pairs", flush=True)
 
-    if not train_features or sum(train_labels) < 10:
-        context.add_note("Step 8: insufficient training data for ML model — writing candidates without ML scoring.")
-        # Write all candidates with a default score
+    if not train_features or n_pos < 10:
+        context.add_note("Step 6a: insufficient training data for ML model.")
         default_scores = np.full(len(candidates), 0.50)
         n_predictions = write_ml_predictions(context, candidates, default_scores)
         context.ml_predictions_count = n_predictions
@@ -1325,8 +1104,8 @@ def run(context: PipelineContext) -> PipelineContext:
             json.dump({"status": "fallback", "reason": "insufficient training data"}, handle, indent=2)
         return context
 
-    # 4. Extract features for expanded candidates
-    print("  Extracting features for expanded candidates...", flush=True)
+    # 3. Extract features for candidates
+    print("    Extracting features for expanded candidates...", flush=True)
     predict_features: list[dict[str, float]] = []
     for i, candidate in enumerate(candidates):
         if candidate.compound_id not in compound_feature_cache:
@@ -1337,78 +1116,54 @@ def run(context: PipelineContext) -> PipelineContext:
         pf = extract_pair_features(candidate.compound_id, candidate, cf, context)
         predict_features.append({**cf, **pf})
         if (i + 1) % PROGRESS_EVERY == 0 or (i + 1) == len(candidates):
-            print(f"    features: {i + 1}/{len(candidates)}", flush=True)
+            print(f"      features: {i + 1}/{len(candidates)}", flush=True)
 
-    # 5. Train model and predict
-    print("  Training LogisticRegression and predicting...", flush=True)
-    pred_scores, model_metadata = train_and_predict(
+    # 4. Train and predict
+    print("    Training LogisticRegression and predicting...", flush=True)
+    pred_scores, model_metadata = train_and_predict_aracyc(
         train_features, train_labels, train_metadata, predict_features, context
     )
 
-    # 6. Write predictions
+    # 5. Write predictions
     n_predictions = write_ml_predictions(context, candidates, pred_scores)
     context.ml_predictions_count = n_predictions
-    print(f"  ML predictions above threshold ({ML_SCORE_THRESHOLD}): {n_predictions}", flush=True)
+    print(f"    ML predictions above threshold ({ML_SCORE_THRESHOLD}): {n_predictions}", flush=True)
 
-    # 7. Write model metadata
-    # Add coverage stats
-    compounds_with_expanded = len(set(
-        c.compound_id for c, s in zip(candidates, pred_scores) if s >= ML_SCORE_THRESHOLD
-    ))
-    compounds_with_primary = len(set(
-        cid for cid, rows in context.ranked_pathway_rows.items() if rows
-    ))
-    total_compounds = len(context.compounds)
+    # 6. Write metadata with coverage stats
+    primary_reference_keys = {
+        matches[0].reference_compound_key
+        for compound_id, rows in context.aracyc_ranked_rows.items()
+        if rows
+        for matches in [context.aracyc_matches_by_compound.get(compound_id, [])]
+        if matches and matches[0].source_db == "AraCyc"
+    }
+    expanded_reference_keys = {
+        matches[0].reference_compound_key
+        for candidate, score in zip(candidates, pred_scores)
+        if score >= ML_SCORE_THRESHOLD
+        for matches in [context.aracyc_matches_by_compound.get(candidate.compound_id, [])]
+        if matches and matches[0].source_db == "AraCyc"
+    }
+    compounds_with_primary = len(primary_reference_keys)
+    compounds_with_expanded = len(primary_reference_keys | expanded_reference_keys)
+    total_compounds = context.aracyc_reference_total()
+    model_metadata["coverage_basis"] = "aracyc_reference_compounds"
+    model_metadata["chebi_input_total"] = len(context.compounds)
     model_metadata["coverage_primary_only"] = compounds_with_primary
-    model_metadata["coverage_with_expanded"] = compounds_with_primary + compounds_with_expanded
+    model_metadata["coverage_with_expanded"] = compounds_with_expanded
     model_metadata["total_compounds"] = total_compounds
     model_metadata["coverage_primary_pct"] = round(100 * compounds_with_primary / max(total_compounds, 1), 2)
     model_metadata["coverage_expanded_pct"] = round(
-        100 * (compounds_with_primary + compounds_with_expanded) / max(total_compounds, 1), 2
+        100 * compounds_with_expanded / max(total_compounds, 1), 2
     )
 
     with context.paths.ml_model_metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(model_metadata, handle, indent=2, ensure_ascii=False)
 
-    print(f"  Coverage: primary={compounds_with_primary} ({model_metadata['coverage_primary_pct']}%) "
-          f"→ with expanded={compounds_with_primary + compounds_with_expanded} ({model_metadata['coverage_expanded_pct']}%)", flush=True)
-
-    return context
-
-
-# ---------------------------------------------------------------------------
-# Standalone CLI
-# ---------------------------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    return build_parser(
-        description="Run the pipeline with expanded recall + ML scoring (steps 1-8).",
-        default_output_tag="step8_cli",
-    ).parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    context = build_context(workdir=args.workdir, output_tag=args.output_tag)
-    run_step1(context)
-    run_step2(context)
-    run_step3(context)
-    run_step4(context)
-    run_step5(context)
-    run_step6(context)
-    run(context)
-    print_summary(
-        "Step 8 expanded recall completed.",
-        [
-            f"Expanded candidates: {context.paths.expanded_candidates_path}",
-            f"ML predictions: {context.paths.ml_pathway_predictions_path}",
-            f"Model: {context.paths.ml_model_path}",
-            f"Metadata: {context.paths.ml_model_metadata_path}",
-            f"Candidates generated: {context.expanded_candidates_count}",
-            f"Predictions above threshold: {context.ml_predictions_count}",
-        ],
+    print(
+        f"    Coverage: primary={compounds_with_primary} ({model_metadata['coverage_primary_pct']}%) "
+        f"→ with expanded={compounds_with_expanded} ({model_metadata['coverage_expanded_pct']}%)",
+        flush=True,
     )
 
-
-if __name__ == "__main__":
-    main()
+    return context

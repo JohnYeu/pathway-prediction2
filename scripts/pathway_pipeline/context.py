@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from process_chebi_to_pathways_v2 import (
     AliasRecord,
@@ -160,6 +161,127 @@ class RankedPathwayRow:
     reason: str
 
 
+# ---------------------------------------------------------------------------
+# AraCyc-first pipeline data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class AraCycCompoundMatch:
+    """Result of matching one ChEBI compound to an AraCyc/PlantCyc compound."""
+
+    aracyc_compound_id: str
+    aracyc_common_name: str
+    source_db: str  # "AraCyc" or "PlantCyc"
+    match_method: str  # "chebi_xref" | "kegg_xref" | "inchikey" | "tanimoto" | "name_exact" | "name_variant"
+    match_score: float  # 0.0-1.0, method-dependent
+    chebi_xref_direct: bool
+    structure_validated: bool  # True if InChIKey/SMILES confirmed
+    pathways: tuple[str, ...]  # pathway names from the PMN compound file
+    smiles: str
+    ec_numbers: tuple[str, ...]
+    plant_record_id: str  # e.g. "AraCyc:UDP-D-XYLOSE"
+    reference_compound_key: str
+
+
+@dataclass(slots=True)
+class AraCycPathwayHit:
+    """AraCyc compound-pathway link with reaction context."""
+
+    compound_id: str  # ChEBI compound_id
+    match: AraCycCompoundMatch
+    pathway_id: str  # PWY-xxxx from aracyc_pathways
+    pathway_name: str  # human-readable name
+    ec_numbers: tuple[str, ...]
+    reaction_ids: tuple[str, ...]
+    reaction_equations: tuple[str, ...]
+    source_db: str  # "AraCyc" or "PlantCyc"
+
+
+@dataclass(slots=True)
+class AnnotatedAraCycHit:
+    """AraCyc pathway hit enriched with gene, EC, and classification context."""
+
+    compound_id: str
+    match: AraCycCompoundMatch
+    pathway_id: str
+    pathway_name: str
+    pathway_category: str  # extracted from name: biosynthesis, degradation, etc.
+    ec_numbers: tuple[str, ...]
+    reaction_ids: tuple[str, ...]
+    reaction_count: int  # total reactions in this pathway
+    compound_count: int  # total compounds participating in this pathway
+    gene_ids: tuple[str, ...]  # AT-locus IDs
+    gene_names: tuple[str, ...]
+    gene_count: int
+    go_best_term: str
+    go_best_fdr: float
+    plant_reactome_best_id: str
+    plant_reactome_best_name: str
+    plant_reactome_alignment_score: float
+    plant_reactome_alignment_confidence: str
+    annotation_confidence: str
+    source_db: str
+    cofactor_like: bool
+
+
+@dataclass(slots=True)
+class AraCycRankedRow:
+    """Final row layout for the AraCyc-first pipeline output."""
+
+    compound_id: str
+    chebi_accession: str
+    chebi_name: str
+    pathway_rank: int
+    score: float
+    confidence_level: str
+    evidence_type: str
+    match_method: str
+    match_score: float
+    aracyc_compound_id: str
+    aracyc_compound_name: str
+    source_db: str
+    pathway_id: str
+    pathway_name: str
+    pathway_category: str
+    gene_count: int
+    gene_ids: str
+    ec_numbers: str
+    reaction_count: int
+    compound_count: int
+    go_best_term: str
+    go_best_fdr: float
+    plant_reactome_best_category: str
+    plant_reactome_alignment_confidence: str
+    annotation_confidence: str
+    chebi_xref_direct: bool
+    structure_validated: bool
+    cofactor_like: bool
+    top_positive_features: str
+    top_negative_features: str
+    feature_contributions_json: str
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+# AraCyc pathway metadata (from aracyc_pathways file)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class AraCycPathwayInfo:
+    """Aggregated metadata for one AraCyc pathway ID."""
+
+    pathway_id: str
+    pathway_name: str
+    reaction_ids: set[str]
+    ec_numbers: set[str]
+    gene_ids: set[str]
+    gene_names: set[str]
+    protein_ids: set[str]
+    compound_ids: set[str]  # AraCyc compound IDs participating
+
+
 @dataclass(slots=True)
 class PipelinePaths:
     """All well-known input and output paths used by the refactored pipeline."""
@@ -224,6 +346,13 @@ class PipelinePaths:
     plant_reactome_gene_index_path: Path
     plant_reactome_alignment_path: Path
     plant_evidence_index_path: Path
+    # AraCyc-first pipeline preprocessed indexes
+    name_to_aracyc_index_path: Path
+    compound_structure_aracyc_index_path: Path
+    aracyc_compound_pathway_index_path: Path
+    aracyc_pathway_annotation_index_path: Path
+    aracyc_pathway_output_path: Path
+
     expanded_candidates_path: Path
     ml_training_pairs_path: Path
     ml_pathway_predictions_path: Path
@@ -306,6 +435,11 @@ class PipelinePaths:
             plant_reactome_gene_index_path=preprocessed_dir / "plant_reactome_gene_index.tsv",
             plant_reactome_alignment_path=preprocessed_dir / "plant_reactome_alignment.tsv",
             plant_evidence_index_path=preprocessed_dir / "plant_evidence_index.tsv",
+            name_to_aracyc_index_path=preprocessed_dir / "name_to_aracyc_index.tsv",
+            compound_structure_aracyc_index_path=preprocessed_dir / "compound_structure_aracyc_index.tsv",
+            aracyc_compound_pathway_index_path=preprocessed_dir / "aracyc_compound_pathway_index.tsv",
+            aracyc_pathway_annotation_index_path=preprocessed_dir / "aracyc_pathway_annotation_index.tsv",
+            aracyc_pathway_output_path=outputs / f"chebi_pathways_aracyc{suffix}.tsv",
             expanded_candidates_path=preprocessed_dir / "compound_to_external_pathway_candidates.tsv",
             ml_training_pairs_path=preprocessed_dir / "ml_training_pairs.tsv",
             ml_pathway_predictions_path=preprocessed_dir / "ml_pathway_predictions.tsv",
@@ -423,6 +557,16 @@ class PipelineContext:
     preprocess_counts: Counter[str] = field(default_factory=Counter)
     preprocess_version: str = ""
 
+    # AraCyc-first pipeline state
+    aracyc_pathway_info: dict[str, AraCycPathwayInfo] = field(default_factory=dict)
+    aracyc_pathway_compound_counts: dict[str, int] = field(default_factory=dict)
+    aracyc_matches_by_compound: dict[str, list[AraCycCompoundMatch]] = field(default_factory=dict)
+    aracyc_pathway_hits: dict[str, list[AraCycPathwayHit]] = field(default_factory=dict)
+    annotated_aracyc_hits: dict[str, list[AnnotatedAraCycHit]] = field(default_factory=dict)
+    aracyc_ranked_rows: dict[str, list[AraCycRankedRow]] = field(default_factory=dict)
+    aracyc_mapping_status: Counter[str] = field(default_factory=Counter)
+    aracyc_reference_compound_keys: set[str] = field(default_factory=set)
+
     expanded_candidates_count: int = 0
     ml_predictions_count: int = 0
 
@@ -433,3 +577,8 @@ class PipelineContext:
 
         if note not in self.step_notes:
             self.step_notes.append(note)
+
+    def aracyc_reference_total(self) -> int:
+        """Return the Arabidopsis reference compound count for AraCyc-first coverage."""
+
+        return len(self.aracyc_reference_compound_keys)

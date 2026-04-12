@@ -1,23 +1,11 @@
-"""Step 5: annotate pathways with KEGG BRITE, GO BP, PMN, and Plant Reactome.
+"""Legacy KEGG pathway annotation support helpers.
 
-This step upgrades the pathway annotation layer from:
-
-- pathway name
-- coarse KEGG category
-- ath gene count
-- exact-name Reactome context
-
-to a richer, reproducible annotation bundle that also includes:
-
-- full KEGG BRITE hierarchy (L1/L2/L3)
-- pathway-level Arabidopsis GO BP enrichment
-- PMN/AraCyc-derived plant evidence and lightweight plant tags
-- Plant Reactome alignment, category, and description context
+These functions back shared loaders and utilities still reused by the active
+AraCyc-first pipeline.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 from datetime import UTC, datetime
 import gzip
@@ -55,12 +43,21 @@ from process_chebi_to_pathways_v2 import (
     normalize_name,
 )
 
-from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
 from pathway_pipeline.context import PipelineContext, Step5AnnotatedPathwayHit
-from pathway_pipeline.step1_alias_standardization import run as run_step1
-from pathway_pipeline.step2_map_names_to_kegg import run as run_step2
-from pathway_pipeline.step3_link_compounds_to_pathways import run as run_step3
-from pathway_pipeline.step4_map_to_ath import run as run_step4
+
+
+def load_ath_pathways(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Load ath pathway names and a mapXXXX -> athXXXX conversion table."""
+
+    ath_pathways: dict[str, str] = {}
+    map_to_ath: dict[str, str] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            pathway_id, raw_name = line.rstrip("\n").split("\t", 1)
+            pathway_name = raw_name.split(" - ", 1)[0]
+            ath_pathways[pathway_id] = pathway_name
+            map_to_ath[f"map{pathway_id[3:]}"] = pathway_id
+    return ath_pathways, map_to_ath
 
 
 def load_map_pathways(path: Path) -> dict[str, str]:
@@ -1380,39 +1377,3 @@ def run(context: PipelineContext) -> PipelineContext:
         "Step 5 enriches pathways with KEGG BRITE, Arabidopsis GO BP enrichment, PMN plant evidence, and Plant Reactome local alignment context."
     )
     return context
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for standalone step-5 execution."""
-
-    return build_parser(
-        description="Run pathway pipeline steps 1-5: annotate resolved pathways with KEGG BRITE, GO, PMN, and Plant Reactome context.",
-        default_output_tag="step5_cli",
-    ).parse_args()
-
-
-def main() -> None:
-    """Run steps 1-5 and report annotation coverage."""
-
-    args = parse_args()
-    context = build_context(workdir=args.workdir, output_tag=args.output_tag)
-    run_step1(context)
-    run_step2(context)
-    run_step3(context)
-    run_step4(context)
-    run(context)
-    annotated_count = sum(len(hits) for hits in context.annotated_pathway_hits.values())
-    print_summary(
-        "Step 5 completed.",
-        [
-            f"Annotated pathway hits: {annotated_count}",
-            f"Pathway annotation index: {context.paths.pathway_annotation_index_path}",
-            f"GO enrichment index: {context.paths.pathway_go_enrichment_index_path}",
-            f"Plant evidence index: {context.paths.plant_evidence_index_path}",
-            f"Plant Reactome alignment index: {context.paths.plant_reactome_alignment_path}",
-        ],
-    )
-
-
-if __name__ == "__main__":
-    main()

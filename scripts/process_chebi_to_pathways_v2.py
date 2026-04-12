@@ -718,7 +718,7 @@ def ensure_exists(path: Path) -> None:
 def load_compounds(path: Path) -> dict[str, ChEBICompound]:
     """Compatibility wrapper for the step-1-owned compound loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_compounds as _impl
+    from pathway_pipeline.step1_standardize_names import load_compounds as _impl
 
     return _impl(path)
 
@@ -726,7 +726,7 @@ def load_compounds(path: Path) -> dict[str, ChEBICompound]:
 def load_comments_profile(path: Path) -> dict[str, int]:
     """Compatibility wrapper for the step-1-owned comments profiler."""
 
-    from pathway_pipeline.step1_alias_standardization import load_comments_profile as _impl
+    from pathway_pipeline.step1_standardize_names import load_comments_profile as _impl
 
     return _impl(path)
 
@@ -737,7 +737,7 @@ def load_base_aliases(
 ) -> dict[str, list[AliasRecord]]:
     """Compatibility wrapper for the step-1-owned base alias loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_base_aliases as _impl
+    from pathway_pipeline.step1_standardize_names import load_base_aliases as _impl
 
     return _impl(compounds, names_path)
 
@@ -745,7 +745,7 @@ def load_base_aliases(
 def load_xrefs(path: Path) -> dict[str, XrefInfo]:
     """Compatibility wrapper for the step-1-owned xref loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_xrefs as _impl
+    from pathway_pipeline.step1_standardize_names import load_xrefs as _impl
 
     return _impl(path)
 
@@ -753,7 +753,7 @@ def load_xrefs(path: Path) -> dict[str, XrefInfo]:
 def load_formula_info(path: Path) -> dict[str, tuple[str, str]]:
     """Compatibility wrapper for the step-1-owned formula loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_formula_info as _impl
+    from pathway_pipeline.step1_standardize_names import load_formula_info as _impl
 
     return _impl(path)
 
@@ -761,7 +761,7 @@ def load_formula_info(path: Path) -> dict[str, tuple[str, str]]:
 def load_structures(path: Path, formulas: dict[str, tuple[str, str]]) -> dict[str, StructureInfo]:
     """Compatibility wrapper for the step-1-owned structure loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_structures as _impl
+    from pathway_pipeline.step1_standardize_names import load_structures as _impl
 
     return _impl(path, formulas)
 
@@ -774,7 +774,7 @@ def build_name_formula_index(
 ) -> dict[str, set[str]]:
     """Compatibility wrapper for the step-1-owned formula validation index."""
 
-    from pathway_pipeline.step1_alias_standardization import build_name_formula_index as _impl
+    from pathway_pipeline.step1_standardize_names import build_name_formula_index as _impl
 
     return _impl(base_aliases, structures, plantcyc_records, lipidmaps_records)
 
@@ -813,7 +813,7 @@ def build_kegg_structure_indexes(
 ) -> dict[str, dict[str, dict[str, set[str]]]]:
     """Compatibility wrapper for the step-2-owned KEGG structure bridge logic."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import build_kegg_structure_indexes as _impl
+    from pathway_pipeline.name_mapping_support import build_kegg_structure_indexes as _impl
 
     return _impl(structures, xrefs, lipidmaps_records)
 
@@ -823,7 +823,7 @@ def build_plantcyc_compound_index(
 ) -> list[dict[str, object]]:
     """Compatibility wrapper for the step-2-owned PMN audit table builder."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import build_plantcyc_compound_index as _impl
+    from pathway_pipeline.name_mapping_support import build_plantcyc_compound_index as _impl
 
     return _impl(plantcyc_records)
 
@@ -835,7 +835,7 @@ def build_kegg_structure_index(
 ) -> list[dict[str, object]]:
     """Compatibility wrapper for the step-2-owned KEGG structure table writer."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import build_kegg_structure_index as _impl
+    from pathway_pipeline.name_mapping_support import build_kegg_structure_index as _impl
 
     return _impl(structures, xrefs, lipidmaps_records)
 
@@ -879,7 +879,7 @@ def _build_pubchem_to_kegg_bridge_index(
 def bridge_confidence_label(score: float) -> str:
     """Compatibility wrapper for the step-2-owned PMN bridge label helper."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import bridge_confidence_label as _impl
+    from pathway_pipeline.name_mapping_support import bridge_confidence_label as _impl
 
     return _impl(score)
 
@@ -895,7 +895,7 @@ def build_plant_to_kegg_bridge(
 ) -> list[PlantToKeggBridge]:
     """Compatibility wrapper for the step-2-owned PMN -> KEGG bridge logic."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import build_plant_to_kegg_bridge as _impl
+    from pathway_pipeline.name_mapping_support import build_plant_to_kegg_bridge as _impl
 
     return _impl(
         compound=compound,
@@ -1025,7 +1025,7 @@ def load_kegg_compounds(
 def load_ath_pathways(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     """Compatibility wrapper for the step-4-owned ath conversion loader."""
 
-    from pathway_pipeline.step4_map_to_ath import load_ath_pathways as _impl
+    from pathway_pipeline.pathway_annotation_support import load_ath_pathways as _impl
 
     return _impl(path)
 
@@ -1033,7 +1033,7 @@ def load_ath_pathways(path: Path) -> tuple[dict[str, str], dict[str, str]]:
 def load_map_pathways(path: Path) -> dict[str, str]:
     """Compatibility wrapper for the step-5-owned KEGG map loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_map_pathways as _impl
+    from pathway_pipeline.pathway_annotation_support import load_map_pathways as _impl
 
     return _impl(path)
 
@@ -1041,7 +1041,7 @@ def load_map_pathways(path: Path) -> dict[str, str]:
 def load_pathway_categories(path: Path) -> dict[str, tuple[str, str, str]]:
     """Compatibility wrapper for the step-5-owned BRITE parser."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_pathway_categories as _impl
+    from pathway_pipeline.pathway_annotation_support import load_pathway_categories as _impl
 
     return _impl(path)
 
@@ -1060,7 +1060,7 @@ def load_kegg_pathway_links(
 def load_ath_gene_counts(path: Path) -> dict[str, int]:
     """Compatibility wrapper for the step-5-owned ath gene counter."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_ath_gene_counts as _impl
+    from pathway_pipeline.pathway_annotation_support import load_ath_gene_counts as _impl
 
     return _impl(path)
 
@@ -1103,7 +1103,7 @@ def load_plantcyc_compounds(
 ]:
     """Compatibility wrapper for the step-1-owned PMN compound loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_plantcyc_compounds as _impl
+    from pathway_pipeline.step1_standardize_names import load_plantcyc_compounds as _impl
 
     return _impl(files)
 
@@ -1111,7 +1111,7 @@ def load_plantcyc_compounds(
 def load_plantcyc_pathway_stats(files: list[tuple[str, Path]]) -> dict[str, dict[str, dict[str, object]]]:
     """Compatibility wrapper for the step-5-owned PMN pathway stats loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_plantcyc_pathway_stats as _impl
+    from pathway_pipeline.pathway_annotation_support import load_plantcyc_pathway_stats as _impl
 
     return _impl(files)
 
@@ -1164,7 +1164,7 @@ def load_lipidmaps_records(
 ]:
     """Compatibility wrapper for the step-1-owned LIPID MAPS loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_lipidmaps_records as _impl
+    from pathway_pipeline.step1_standardize_names import load_lipidmaps_records as _impl
 
     return _impl(path)
 
@@ -1172,7 +1172,7 @@ def load_lipidmaps_records(
 def load_pubchem_synonyms(path: Path, target_cids: set[str]) -> tuple[dict[str, list[str]], dict[str, int]]:
     """Compatibility wrapper for the step-1-owned PubChem synonym loader."""
 
-    from pathway_pipeline.step1_alias_standardization import load_pubchem_synonyms as _impl
+    from pathway_pipeline.step1_standardize_names import load_pubchem_synonyms as _impl
 
     return _impl(path, target_cids)
 
@@ -1180,7 +1180,7 @@ def load_pubchem_synonyms(path: Path, target_cids: set[str]) -> tuple[dict[str, 
 def load_reactome_pathways(path: Path) -> dict[str, list[tuple[str, str]]]:
     """Compatibility wrapper for the step-5-owned Reactome name index."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_reactome_pathways as _impl
+    from pathway_pipeline.pathway_annotation_support import load_reactome_pathways as _impl
 
     return _impl(path)
 
@@ -1228,7 +1228,7 @@ def download_binary_with_fallback(url: str, destination: Path) -> None:
 def iso_mtime(path: Path) -> str:
     """Compatibility wrapper for the step-5-owned file timestamp helper."""
 
-    from pathway_pipeline.step5_annotate_pathways import iso_mtime as _impl
+    from pathway_pipeline.pathway_annotation_support import iso_mtime as _impl
 
     return _impl(path)
 
@@ -1283,7 +1283,7 @@ def extract_agi_loci(*fields: str) -> set[str]:
 def ensure_go_annotations(path: Path) -> str:
     """Compatibility wrapper for the step-5-owned GO snapshot loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import ensure_go_annotations as _impl
+    from pathway_pipeline.pathway_annotation_support import ensure_go_annotations as _impl
 
     return _impl(path)
 
@@ -1291,7 +1291,7 @@ def ensure_go_annotations(path: Path) -> str:
 def load_gene_to_go_bp(gaf_path: Path, go_basic_path: Path) -> tuple[dict[str, set[tuple[str, str]]], dict[str, str], str]:
     """Compatibility wrapper for the step-5-owned GO gene index loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_gene_to_go_bp as _impl
+    from pathway_pipeline.pathway_annotation_support import load_gene_to_go_bp as _impl
 
     return _impl(gaf_path, go_basic_path)
 
@@ -1299,7 +1299,7 @@ def load_gene_to_go_bp(gaf_path: Path, go_basic_path: Path) -> tuple[dict[str, s
 def build_go_term_gene_sets(gene_to_go: dict[str, set[tuple[str, str]]]) -> tuple[dict[str, set[str]], dict[str, str]]:
     """Compatibility wrapper for the step-5-owned GO inversion helper."""
 
-    from pathway_pipeline.step5_annotate_pathways import build_go_term_gene_sets as _impl
+    from pathway_pipeline.pathway_annotation_support import build_go_term_gene_sets as _impl
 
     return _impl(gene_to_go)
 
@@ -1356,7 +1356,7 @@ def compute_pathway_go_enrichment(
 ) -> dict[str, object]:
     """Compatibility wrapper for the step-5-owned GO enrichment helper."""
 
-    from pathway_pipeline.step5_annotate_pathways import compute_pathway_go_enrichment as _impl
+    from pathway_pipeline.pathway_annotation_support import compute_pathway_go_enrichment as _impl
 
     return _impl(pathway_gene_ids, term_to_genes, go_names, background_genes, top_k=top_k)
 
@@ -1407,7 +1407,7 @@ def ensure_plant_reactome_refs(
 ) -> str:
     """Compatibility wrapper for the step-5-owned Plant Reactome snapshotter."""
 
-    from pathway_pipeline.step5_annotate_pathways import ensure_plant_reactome_refs as _impl
+    from pathway_pipeline.pathway_annotation_support import ensure_plant_reactome_refs as _impl
 
     return _impl(pathways_path, gene_path, version_path)
 
@@ -1415,7 +1415,7 @@ def ensure_plant_reactome_refs(
 def load_plant_reactome_pathways(path: Path) -> dict[str, dict[str, str]]:
     """Compatibility wrapper for the step-5-owned Plant Reactome pathway loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_plant_reactome_pathways as _impl
+    from pathway_pipeline.pathway_annotation_support import load_plant_reactome_pathways as _impl
 
     return _impl(path)
 
@@ -1423,7 +1423,7 @@ def load_plant_reactome_pathways(path: Path) -> dict[str, dict[str, str]]:
 def load_plant_reactome_gene_index(path: Path) -> dict[str, set[str]]:
     """Compatibility wrapper for the step-5-owned Plant Reactome gene loader."""
 
-    from pathway_pipeline.step5_annotate_pathways import load_plant_reactome_gene_index as _impl
+    from pathway_pipeline.pathway_annotation_support import load_plant_reactome_gene_index as _impl
 
     return _impl(path)
 
@@ -1452,7 +1452,7 @@ def infer_plant_context_tags(
 ) -> tuple[str, ...]:
     """Compatibility wrapper for the step-5-owned plant tag inference."""
 
-    from pathway_pipeline.step5_annotate_pathways import infer_plant_context_tags as _impl
+    from pathway_pipeline.pathway_annotation_support import infer_plant_context_tags as _impl
 
     return _impl(
         brite_l1=brite_l1,
@@ -1511,7 +1511,7 @@ def match_plant_reactome_context(
 ) -> list[dict[str, object]]:
     """Compatibility wrapper for the step-5-owned Plant Reactome matcher."""
 
-    from pathway_pipeline.step5_annotate_pathways import match_plant_reactome_context as _impl
+    from pathway_pipeline.pathway_annotation_support import match_plant_reactome_context as _impl
 
     return _impl(
         pathway_name=pathway_name,
@@ -1536,7 +1536,7 @@ def build_annotation_confidence(
 ) -> str:
     """Compatibility wrapper for the step-5-owned annotation confidence rule."""
 
-    from pathway_pipeline.step5_annotate_pathways import build_annotation_confidence as _impl
+    from pathway_pipeline.pathway_annotation_support import build_annotation_confidence as _impl
 
     return _impl(
         brite_l1=brite_l1,
@@ -1560,7 +1560,7 @@ def gather_external_match_methods(
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """Compatibility wrapper for the step-1-owned external-match summarizer."""
 
-    from pathway_pipeline.step1_alias_standardization import gather_external_match_methods as _impl
+    from pathway_pipeline.step1_standardize_names import gather_external_match_methods as _impl
 
     return _impl(compound, structure, xrefs, base_aliases, plantcyc_records, plantcyc_indexes, lipidmaps_records, lipidmaps_indexes)
 
@@ -1578,7 +1578,7 @@ def build_compound_context(
 ) -> CompoundContext:
     """Compatibility wrapper for the step-1-owned compound-context builder."""
 
-    from pathway_pipeline.step1_alias_standardization import build_compound_context as _impl
+    from pathway_pipeline.step1_standardize_names import build_compound_context as _impl
 
     return _impl(
         compound,
@@ -1596,7 +1596,7 @@ def build_compound_context(
 def reason_summary(candidate: CandidateMapping) -> str:
     """Compatibility wrapper for the step-2-owned explanation helper."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import reason_summary as _impl
+    from pathway_pipeline.name_mapping_support import reason_summary as _impl
 
     return _impl(candidate)
 
@@ -1662,7 +1662,7 @@ def build_candidate_mappings(
 ) -> list[CandidateMapping]:
     """Compatibility wrapper for the step-2-owned candidate builder."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import build_candidate_mappings as _impl
+    from pathway_pipeline.name_mapping_support import build_candidate_mappings as _impl
 
     return _impl(
         compound=compound,
@@ -1683,7 +1683,7 @@ def build_candidate_mappings(
 def select_candidates(ranked: list[CandidateMapping]) -> list[CandidateMapping]:
     """Compatibility wrapper for the step-2-owned candidate selector."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import select_candidates as _impl
+    from pathway_pipeline.name_mapping_support import select_candidates as _impl
 
     return _impl(ranked)
 
@@ -1691,7 +1691,7 @@ def select_candidates(ranked: list[CandidateMapping]) -> list[CandidateMapping]:
 def mapping_method_label(mapping: CandidateMapping) -> str:
     """Compatibility wrapper for the step-2-owned method label helper."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import mapping_method_label as _impl
+    from pathway_pipeline.name_mapping_support import mapping_method_label as _impl
 
     return _impl(mapping)
 
@@ -1699,7 +1699,7 @@ def mapping_method_label(mapping: CandidateMapping) -> str:
 def mapping_confidence_label(score: float) -> str:
     """Compatibility wrapper for the step-2-owned confidence label helper."""
 
-    from pathway_pipeline.step2_map_names_to_kegg import mapping_confidence_label as _impl
+    from pathway_pipeline.name_mapping_support import mapping_confidence_label as _impl
 
     return _impl(score)
 
