@@ -274,6 +274,7 @@ class AraCycPathwayInfo:
 
     pathway_id: str
     pathway_name: str
+    source_dbs: set[str]
     reaction_ids: set[str]
     ec_numbers: set[str]
     gene_ids: set[str]

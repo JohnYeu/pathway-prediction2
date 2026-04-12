@@ -40,7 +40,7 @@ def score_hit(
     hit: AnnotatedAraCycHit,
     max_compound_count: int,
     max_gene_count: int,
-    plantcyc_pathway_ids: set[str],
+    plantcyc_corroborated_pathway_ids: set[str],
 ) -> tuple[float, str, dict[str, float]]:
     """Score one annotated AraCyc pathway hit.
 
@@ -56,7 +56,9 @@ def score_hit(
     reaction_bonus = min(0.05, 0.02 * math.log1p(hit.reaction_count))
 
     # PlantCyc corroboration: pathway also exists in PlantCyc
-    plantcyc_corroboration = hit.pathway_id in plantcyc_pathway_ids if hit.source_db == "AraCyc" else False
+    plantcyc_corroboration = (
+        hit.source_db == "AraCyc" and hit.pathway_id in plantcyc_corroborated_pathway_ids
+    )
 
     contributions = {
         "match_confidence": round(0.30 * hit.match.match_score, 4),
@@ -132,13 +134,12 @@ def run(context: PipelineContext) -> PipelineContext:
         default=1,
     )
 
-    # Collect PlantCyc pathway IDs for corroboration check
-    plantcyc_pathway_ids: set[str] = set()
-    for pid, info in context.aracyc_pathway_info.items():
-        # PlantCyc entries were merged with source tracking;
-        # we check if a pathway exists in both AraCyc and PlantCyc by looking
-        # at the compound sources
-        plantcyc_pathway_ids.add(pid)
+    # Collect pathways that are corroborated by both AraCyc and PlantCyc.
+    plantcyc_corroborated_pathway_ids = {
+        pid
+        for pid, info in context.aracyc_pathway_info.items()
+        if "AraCyc" in info.source_dbs and "PlantCyc" in info.source_dbs
+    }
 
     for compound_id in sorted(context.compounds, key=int):
         hits = context.annotated_aracyc_hits.get(compound_id, [])
@@ -153,7 +154,7 @@ def run(context: PipelineContext) -> PipelineContext:
         aggregated: dict[str, dict] = {}
         for hit in hits:
             score, confidence_level, contributions = score_hit(
-                hit, max_compound_count, max_gene_count, plantcyc_pathway_ids
+                hit, max_compound_count, max_gene_count, plantcyc_corroborated_pathway_ids
             )
             top_pos, top_neg = top_feature_labels(contributions)
             reason = build_reason(hit, score, confidence_level)

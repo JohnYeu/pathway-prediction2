@@ -16,10 +16,9 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from process_chebi_to_pathways_v2 import PlantCycCompound
+from process_chebi_to_pathways_v2 import PlantCycCompound, normalize_name
 
 from pathway_pipeline.context import (
-    AraCycCompoundMatch,
     AraCycPathwayHit,
     AraCycPathwayInfo,
     PipelineContext,
@@ -31,7 +30,7 @@ from pathway_pipeline.context import (
 # ---------------------------------------------------------------------------
 
 
-def load_aracyc_pathway_info(path: Path) -> dict[str, AraCycPathwayInfo]:
+def load_aracyc_pathway_info(path: Path, source_db: str) -> dict[str, AraCycPathwayInfo]:
     """Parse aracyc_pathways reference into pathway metadata.
 
     The file has one row per (pathway, reaction, gene) tuple. We aggregate
@@ -48,6 +47,7 @@ def load_aracyc_pathway_info(path: Path) -> dict[str, AraCycPathwayInfo]:
                 info = AraCycPathwayInfo(
                     pathway_id=pid,
                     pathway_name=pname,
+                    source_dbs={source_db},
                     reaction_ids=set(),
                     ec_numbers=set(),
                     gene_ids=set(),
@@ -74,36 +74,41 @@ def load_aracyc_pathway_info(path: Path) -> dict[str, AraCycPathwayInfo]:
     return pathways
 
 
-def _build_pathway_name_to_id(
+def _build_pathway_name_indexes(
     pathway_info: dict[str, AraCycPathwayInfo],
-) -> dict[str, str]:
-    """Map pathway name -> pathway ID for joining with compound-level pathway names."""
-    name_to_id: dict[str, str] = {}
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map pathway names to IDs using exact and normalized forms."""
+    exact_name_to_id: dict[str, str] = {}
+    normalized_name_to_id: dict[str, str] = {}
     for pid, info in pathway_info.items():
-        name_to_id[info.pathway_name] = pid
-    return name_to_id
+        exact_name_to_id[info.pathway_name] = pid
+        normalized = normalize_name(info.pathway_name)
+        if normalized:
+            normalized_name_to_id.setdefault(normalized, pid)
+    return exact_name_to_id, normalized_name_to_id
 
 
-def _build_compound_pathway_links(
-    records: dict[str, PlantCycCompound],
-) -> dict[str, dict[str, list[dict[str, str]]]]:
-    """Build compound_id -> pathway_name -> list of {ec, reaction_equation} from raw compound rows.
+def _merge_pathway_info(target: AraCycPathwayInfo, incoming: AraCycPathwayInfo) -> None:
+    # Only source_dbs is merged. Gene/EC/compound/reaction fields feed step 5
+    # scoring and must stay AraCyc-only so PlantCyc's multi-species content
+    # does not inflate gene_support, ec_support, or pathway_specificity.
+    target.source_dbs.update(incoming.source_dbs)
 
-    Re-reads the raw file to get per-row EC and reaction_equation data that
-    was not preserved in PlantCycCompound (which only stores unique pathways).
-    """
-    # PlantCycCompound already aggregates pathways, but we need the per-row
-    # EC and reaction_equation detail. We rely on the already-parsed records
-    # for the pathway set, and enrich with EC data from the records themselves.
-    links: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(lambda: defaultdict(list))
-    # The PlantCycCompound doesn't store per-row EC/reaction data, so we can
-    # only use what's available. We'll enrich from the pathway info instead.
-    return dict(links)
+
+def _resolve_pathway_id(
+    pathway_name: str,
+    exact_name_to_id: dict[str, str],
+    normalized_name_to_id: dict[str, str],
+) -> str:
+    """Resolve a raw pathway name to the best-known pathway ID."""
+    pathway_id = exact_name_to_id.get(pathway_name, "")
+    if pathway_id:
+        return pathway_id
+    return normalized_name_to_id.get(normalize_name(pathway_name), "")
 
 
 def _read_compound_pathway_detail(
     path: Path,
-    source_db: str,
 ) -> dict[str, dict[str, list[dict[str, str]]]]:
     """Re-read compound file to get per-row EC and reaction_equation per (compound, pathway).
 
@@ -178,32 +183,45 @@ def run(context: PipelineContext) -> PipelineContext:
     print("  Step 3a: Loading AraCyc pathway reference...", flush=True)
 
     # Load pathway metadata from aracyc_pathways file
-    pathway_info = load_aracyc_pathway_info(context.paths.aracyc_pathways_path)
+    pathway_info = load_aracyc_pathway_info(context.paths.aracyc_pathways_path, "AraCyc")
     context.aracyc_pathway_info = pathway_info
-    pathway_name_to_id = _build_pathway_name_to_id(pathway_info)
+    pathway_name_to_id, normalized_pathway_name_to_id = _build_pathway_name_indexes(pathway_info)
 
     print(f"    AraCyc pathways loaded: {len(pathway_info)}", flush=True)
 
     # Also load PlantCyc pathway info if available
     plantcyc_pathway_info: dict[str, AraCycPathwayInfo] = {}
     if context.paths.plantcyc_pathways_path.exists():
-        plantcyc_pathway_info = load_aracyc_pathway_info(context.paths.plantcyc_pathways_path)
-        # Add PlantCyc pathways to the name-to-id index (AraCyc takes priority)
+        plantcyc_pathway_info = load_aracyc_pathway_info(context.paths.plantcyc_pathways_path, "PlantCyc")
+        # Add PlantCyc pathways to the name indexes, merging exact/normalized
+        # name matches into the existing AraCyc metadata record so downstream
+        # corroboration checks can see both sources on the same pathway object.
         for pid, info in plantcyc_pathway_info.items():
-            if info.pathway_name not in pathway_name_to_id:
-                pathway_name_to_id[info.pathway_name] = pid
-            # Also merge into main pathway_info
-            if pid not in context.aracyc_pathway_info:
-                context.aracyc_pathway_info[pid] = info
+            existing_pid = _resolve_pathway_id(
+                info.pathway_name,
+                pathway_name_to_id,
+                normalized_pathway_name_to_id,
+            )
+            if existing_pid:
+                _merge_pathway_info(context.aracyc_pathway_info[existing_pid], info)
+                pathway_name_to_id.setdefault(info.pathway_name, existing_pid)
+                normalized_name = normalize_name(info.pathway_name)
+                if normalized_name:
+                    normalized_pathway_name_to_id.setdefault(normalized_name, existing_pid)
+                continue
+
+            pathway_name_to_id[info.pathway_name] = pid
+            normalized_name = normalize_name(info.pathway_name)
+            if normalized_name:
+                normalized_pathway_name_to_id.setdefault(normalized_name, pid)
+            context.aracyc_pathway_info[pid] = info
         print(f"    PlantCyc pathways loaded: {len(plantcyc_pathway_info)}", flush=True)
+    else:
+        print("    Optional input missing: plantcyc_pathways.20230103; skipping PlantCyc pathway corroboration.", flush=True)
 
     # Read per-row compound-pathway detail from raw files
-    aracyc_detail = _read_compound_pathway_detail(
-        context.paths.aracyc_compounds_path, "AraCyc"
-    )
-    plantcyc_detail = _read_compound_pathway_detail(
-        context.paths.plantcyc_compounds_path, "PlantCyc"
-    )
+    aracyc_detail = _read_compound_pathway_detail(context.paths.aracyc_compounds_path)
+    plantcyc_detail = _read_compound_pathway_detail(context.paths.plantcyc_compounds_path)
 
     # Build compound-to-pathway counts (how many compounds per pathway)
     pathway_compound_counter: dict[str, set[str]] = defaultdict(set)
@@ -220,7 +238,11 @@ def run(context: PipelineContext) -> PipelineContext:
         for match in matches:
             # Get the pathway names from the match (already stored)
             for pathway_name in match.pathways:
-                pathway_id = pathway_name_to_id.get(pathway_name, "")
+                pathway_id = _resolve_pathway_id(
+                    pathway_name,
+                    pathway_name_to_id,
+                    normalized_pathway_name_to_id,
+                )
 
                 # Get EC and reaction detail from raw file
                 detail_source = aracyc_detail if match.source_db == "AraCyc" else plantcyc_detail

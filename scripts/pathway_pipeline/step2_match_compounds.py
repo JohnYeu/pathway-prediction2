@@ -166,6 +166,32 @@ def _reference_compound_key(record: PlantCycCompound) -> str:
     return f"record:{record.record_id}"
 
 
+def _build_match(
+    record: PlantCycCompound,
+    *,
+    method: str,
+    score: float,
+    chebi_xref_direct: bool,
+    structure_validated: bool,
+    discount: float = 1.0,
+) -> AraCycCompoundMatch:
+    """Build one AraCyc/PlantCyc match row."""
+    return AraCycCompoundMatch(
+        aracyc_compound_id=record.compound_id,
+        aracyc_common_name=record.common_name,
+        source_db=record.source_db,
+        match_method=method,
+        match_score=round(score * discount, 4),
+        chebi_xref_direct=chebi_xref_direct,
+        structure_validated=structure_validated,
+        pathways=tuple(sorted(record.pathways)),
+        smiles=record.smiles,
+        ec_numbers=(),
+        plant_record_id=record.record_id,
+        reference_compound_key=_reference_compound_key(record),
+    )
+
+
 def _chebi_inchikey(compound_id: str, structures: dict[str, StructureInfo]) -> str:
     """Get InChIKey for a ChEBI compound from preloaded structures."""
     si = structures.get(compound_id)
@@ -220,29 +246,6 @@ def _match_one_compound(
     """
     matches: list[AraCycCompoundMatch] = []
 
-    # Helper to create match from a PlantCycCompound record
-    def _make_match(
-        record: PlantCycCompound,
-        method: str,
-        score: float,
-        chebi_xref_direct: bool,
-        structure_validated: bool,
-    ) -> AraCycCompoundMatch:
-        return AraCycCompoundMatch(
-            aracyc_compound_id=record.compound_id,
-            aracyc_common_name=record.common_name,
-            source_db=record.source_db,
-            match_method=method,
-            match_score=score,
-            chebi_xref_direct=chebi_xref_direct,
-            structure_validated=structure_validated,
-            pathways=tuple(sorted(record.pathways)),
-            smiles=record.smiles,
-            ec_numbers=(),  # populated later from pathway join
-            plant_record_id=record.record_id,
-            reference_compound_key=_reference_compound_key(record),
-        )
-
     seen_record_ids: set[str] = set()
     chebi_accession = f"CHEBI:{compound_id}"
 
@@ -252,7 +255,7 @@ def _match_one_compound(
             continue
         seen_record_ids.add(record_id)
         record = aracyc_records[record_id]
-        matches.append(_make_match(record, "chebi_xref", 1.00, True, False))
+        matches.append(_build_match(record, method="chebi_xref", score=1.00, chebi_xref_direct=True, structure_validated=False))
 
     # --- Tier 2: KEGG xref bridge (AraCyc) ---
     xref_info = xrefs.get(compound_id)
@@ -263,7 +266,7 @@ def _match_one_compound(
                     continue
                 seen_record_ids.add(record_id)
                 record = aracyc_records[record_id]
-                matches.append(_make_match(record, "kegg_xref", 0.95, False, False))
+                matches.append(_build_match(record, method="kegg_xref", score=0.95, chebi_xref_direct=False, structure_validated=False))
 
     # --- Tier 3: InChIKey exact match (AraCyc) ---
     chebi_ik = _chebi_inchikey(compound_id, structures)
@@ -273,7 +276,7 @@ def _match_one_compound(
                 continue
             seen_record_ids.add(record_id)
             record = aracyc_records[record_id]
-            matches.append(_make_match(record, "inchikey", 0.90, False, True))
+            matches.append(_build_match(record, method="inchikey", score=0.90, chebi_xref_direct=False, structure_validated=True))
 
     # --- Tier 3b: Tanimoto similarity >= 0.85 (AraCyc) ---
     # Disabled by default: O(N*M) brute-force is too slow for 200K compounds.
@@ -309,7 +312,7 @@ def _match_one_compound(
                     continue
                 seen_record_ids.add(record_id)
                 record = aracyc_records[record_id]
-                matches.append(_make_match(record, f"name_{vtype}", name_match_scores[vtype], False, False))
+                matches.append(_build_match(record, method=f"name_{vtype}", score=name_match_scores[vtype], chebi_xref_direct=False, structure_validated=False))
 
     # --- Tier 5: PlantCyc fallback (same tiers, discounted by 0.85) ---
     if not matches:
@@ -344,22 +347,6 @@ def _match_plantcyc_fallback(
     DISCOUNT = 0.85
     matches: list[AraCycCompoundMatch] = []
 
-    def _make_match(record, method, score, chebi_xref_direct, structure_validated):
-        return AraCycCompoundMatch(
-            aracyc_compound_id=record.compound_id,
-            aracyc_common_name=record.common_name,
-            source_db=record.source_db,
-            match_method=method,
-            match_score=round(score * DISCOUNT, 4),
-            chebi_xref_direct=chebi_xref_direct,
-            structure_validated=structure_validated,
-            pathways=tuple(sorted(record.pathways)),
-            smiles=record.smiles,
-            ec_numbers=(),
-            plant_record_id=record.record_id,
-            reference_compound_key=_reference_compound_key(record),
-        )
-
     chebi_accession = f"CHEBI:{compound_id}"
 
     # ChEBI xref
@@ -367,7 +354,7 @@ def _match_plantcyc_fallback(
         if record_id in seen_record_ids:
             continue
         seen_record_ids.add(record_id)
-        matches.append(_make_match(plantcyc_records[record_id], "chebi_xref", 1.00, True, False))
+        matches.append(_build_match(plantcyc_records[record_id], method="chebi_xref", score=1.00, chebi_xref_direct=True, structure_validated=False, discount=DISCOUNT))
 
     # KEGG xref bridge
     xref_info = xrefs.get(compound_id)
@@ -377,7 +364,7 @@ def _match_plantcyc_fallback(
                 if record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(record_id)
-                matches.append(_make_match(plantcyc_records[record_id], "kegg_xref", 0.95, False, False))
+                matches.append(_build_match(plantcyc_records[record_id], method="kegg_xref", score=0.95, chebi_xref_direct=False, structure_validated=False, discount=DISCOUNT))
 
     # InChIKey
     chebi_ik = _chebi_inchikey(compound_id, structures)
@@ -386,7 +373,7 @@ def _match_plantcyc_fallback(
             if record_id in seen_record_ids:
                 continue
             seen_record_ids.add(record_id)
-            matches.append(_make_match(plantcyc_records[record_id], "inchikey", 0.90, False, True))
+            matches.append(_build_match(plantcyc_records[record_id], method="inchikey", score=0.90, chebi_xref_direct=False, structure_validated=True, discount=DISCOUNT))
 
     # Tanimoto — disabled (see AraCyc tier 3b comment above)
 
@@ -402,7 +389,7 @@ def _match_plantcyc_fallback(
                 if record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(record_id)
-                matches.append(_make_match(plantcyc_records[record_id], f"name_{vtype}", name_scores[vtype], False, False))
+                matches.append(_build_match(plantcyc_records[record_id], method=f"name_{vtype}", score=name_scores[vtype], chebi_xref_direct=False, structure_validated=False, discount=DISCOUNT))
 
     return matches
 

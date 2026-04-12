@@ -1,6 +1,6 @@
 """Step 1: alias normalization and alias-table materialization.
 
-This module is responsible for all name-side preparation before KEGG mapping.
+This module is responsible for all name-side preparation before pathway matching.
 It does four things in order:
 
 1. Load the core ChEBI compound table and profile comments.tsv.
@@ -851,7 +851,7 @@ def run(context: PipelineContext) -> PipelineContext:
     formula_rows = aggregate_name_formula_rows(context)
     context.preprocess_counts["name_to_formula_index"] = write_name_to_formula_index(context, formula_rows)
     context.preprocess_counts["pubchem_target_cids"] = context.pubchem_stats.get("target_cids", 0)
-    context.add_note("Step 1 wrote the standardized alias table before KEGG mapping.")
+    context.add_note("Step 1 wrote the standardized alias table before downstream compound matching.")
     return context
 
 
