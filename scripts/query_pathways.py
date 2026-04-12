@@ -287,6 +287,21 @@ class RankedPathway:
     reason: str
 
 
+@dataclass(slots=True)
+class ExpandedPathway:
+    """One ML-scored expanded pathway candidate loaded at query time."""
+
+    compound_id: str
+    chebi_accession: str
+    pathway_id: str
+    pathway_name: str
+    pathway_source: str
+    candidate_origin: str
+    ml_score: float
+    ml_confidence: str
+    reason: str
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for one-shot or interactive querying."""
 
@@ -825,6 +840,32 @@ def load_plant_evidence(path: Path):
     return {compound_id: dict(values) for compound_id, values in evidence.items()}
 
 
+def load_expanded_predictions(path: Path) -> dict[str, list[ExpandedPathway]]:
+    """Load ML-scored expanded pathway predictions, keyed by compound_id."""
+
+    predictions: dict[str, list[ExpandedPathway]] = defaultdict(list)
+    if not path.exists():
+        return dict(predictions)
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            predictions[row["compound_id"]].append(ExpandedPathway(
+                compound_id=row["compound_id"],
+                chebi_accession=row["chebi_accession"],
+                pathway_id=row["pathway_id"],
+                pathway_name=row["pathway_name"],
+                pathway_source=row["pathway_source"],
+                candidate_origin=row["candidate_origin"],
+                ml_score=float(row["ml_score"]),
+                ml_confidence=row["ml_confidence"],
+                reason=row["reason"],
+            ))
+    # Sort each compound's predictions by ml_score descending
+    for compound_id in predictions:
+        predictions[compound_id].sort(key=lambda x: x.ml_score, reverse=True)
+    return dict(predictions)
+
+
 def choose_best_hit(hits, variant_name, stage, best_mapping_score_by_compound, validations):
     """Pick the best compound when a standard-name or alias tier produced hits."""
 
@@ -1269,7 +1310,7 @@ def rank_pmn_fallback_pathways(
     ]
 
 
-def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[RankedPathway], top_k: int) -> None:
+def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[RankedPathway], top_k: int, expanded: list[ExpandedPathway] | None = None) -> None:
     """Render a one-shot query result to the terminal."""
 
     print(f"Query: {query}")
@@ -1292,34 +1333,50 @@ def print_result(query: str, resolved: ResolvedName, mappings, pathways: list[Ra
         )
     else:
         print("KEGG compound IDs: none")
+
+    # Primary pathways
     if not pathways:
         print("Top pathways: none")
-        return
-    print(f"Top {top_k} pathways:")
-    for pathway in pathways:
-        print(
-            f"{pathway.pathway_rank}. {pathway.pathway_name} [{pathway.pathway_target_id}] "
-            f"score={pathway.score:.3f} confidence={pathway.confidence_level}"
-        )
-        if pathway.brite_summary:
-            print(f"   brite: {pathway.brite_summary}")
-        if pathway.go_best_term:
-            print(f"   go_best_term: {pathway.go_best_term}")
-        if pathway.plant_context_tags:
-            print(f"   plant_context_tags: {', '.join(pathway.plant_context_tags)}")
-        if pathway.plant_reactome_best_category:
-            print(f"   plant_reactome_category: {pathway.plant_reactome_best_category}")
-        if pathway.relation_vstamp:
-            print(f"   relation_vstamp: {pathway.relation_vstamp}")
-        if pathway.support_reaction_count:
-            print(f"   support_reactions: {pathway.support_reaction_count}")
-        if pathway.role_summary:
-            print(f"   role_summary: {pathway.role_summary}")
-        if pathway.annotation_confidence:
-            print(f"   annotation_confidence: {pathway.annotation_confidence}")
-        if pathway.pathway_target_type == "pmn_direct":
-            print("   source: direct AraCyc/PlantCyc (PMN) fallback")
-        print(f"   reason: {pathway.reason}")
+    else:
+        print(f"Top {top_k} pathways:")
+        for pathway in pathways:
+            print(
+                f"{pathway.pathway_rank}. {pathway.pathway_name} [{pathway.pathway_target_id}] "
+                f"score={pathway.score:.3f} confidence={pathway.confidence_level}"
+            )
+            if pathway.brite_summary:
+                print(f"   brite: {pathway.brite_summary}")
+            if pathway.go_best_term:
+                print(f"   go_best_term: {pathway.go_best_term}")
+            if pathway.plant_context_tags:
+                print(f"   plant_context_tags: {', '.join(pathway.plant_context_tags)}")
+            if pathway.plant_reactome_best_category:
+                print(f"   plant_reactome_category: {pathway.plant_reactome_best_category}")
+            if pathway.relation_vstamp:
+                print(f"   relation_vstamp: {pathway.relation_vstamp}")
+            if pathway.support_reaction_count:
+                print(f"   support_reactions: {pathway.support_reaction_count}")
+            if pathway.role_summary:
+                print(f"   role_summary: {pathway.role_summary}")
+            if pathway.annotation_confidence:
+                print(f"   annotation_confidence: {pathway.annotation_confidence}")
+            if pathway.pathway_target_type == "pmn_direct":
+                print("   source: direct AraCyc/PlantCyc (PMN) fallback")
+            print(f"   reason: {pathway.reason}")
+
+    # Expanded pathways (shown when primary is empty OR always as separate block)
+    if expanded:
+        if not pathways:
+            print("Expanded pathways [experimental]:")
+        else:
+            print("--- Expanded pathways [experimental] ---")
+        for i, ep in enumerate(expanded, 1):
+            print(
+                f"  E{i}. {ep.pathway_name} [{ep.pathway_source}] "
+                f"ml_score={ep.ml_score:.3f} confidence={ep.ml_confidence}"
+            )
+            print(f"      origin: {ep.candidate_origin}")
+            print(f"      reason: {ep.reason}")
 
 
 def load_preprocessed_state(workdir: Path, verbose: bool = True):
@@ -1376,6 +1433,11 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
     if verbose:
         print("- plant evidence index", flush=True)
     plant_evidence = load_plant_evidence(paths["plant_evidence_index"])
+    expanded_predictions_path = data_dir / "ml_pathway_predictions.tsv"
+    expanded_predictions = load_expanded_predictions(expanded_predictions_path) if expanded_predictions_path.exists() else {}
+    if verbose:
+        n_expanded = sum(len(v) for v in expanded_predictions.values())
+        print(f"- expanded predictions: {n_expanded} entries for {len(expanded_predictions)} compounds", flush=True)
     if verbose:
         print("Preprocessed indexes loaded.", flush=True)
     return {
@@ -1393,6 +1455,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True):
         "map_to_ath": map_to_ath,
         "pathway_annotations": pathway_annotations,
         "plant_evidence": plant_evidence,
+        "expanded_predictions": expanded_predictions,
     }
 
 
@@ -1406,8 +1469,11 @@ def get_structure_indexes(state):
     return state["structure_indexes"]
 
 
-def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[MappingRecord], list[RankedPathway]]:
-    """Run the full query pipeline for one free-text name."""
+def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[MappingRecord], list[RankedPathway], list[ExpandedPathway]]:
+    """Run the full query pipeline for one free-text name.
+
+    Returns (resolved, mappings, primary_pathways, expanded_pathways).
+    """
 
     standard_indexes, alias_indexes, primary_records = state["name_indexes"]
     resolved = resolve_name(
@@ -1419,7 +1485,7 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
         state["best_mapping_score_by_compound"],
     )
     if resolved is None:
-        return None, [], []
+        return None, [], [], []
     name_mappings = lookup_mappings_for_standard_name(resolved.canonical_name, state["mappings_by_name"])
     same_compound_name_mappings = [mapping for mapping in name_mappings if mapping.compound_id == resolved.compound_id]
     if same_compound_name_mappings:
@@ -1478,7 +1544,11 @@ def run_query(query: str, state, top_k: int) -> tuple[ResolvedName | None, list[
             top_k,
             had_kegg_mapping=bool(mappings),
         )
-    return resolved, mappings, pathways
+
+    # Look up expanded predictions for this compound
+    expanded = state.get("expanded_predictions", {}).get(resolved.compound_id, [])[:top_k]
+
+    return resolved, mappings, pathways, expanded
 
 
 def repl(state, top_k: int) -> None:
@@ -1493,11 +1563,11 @@ def repl(state, top_k: int) -> None:
             break
         if not query or query.lower() == "exit":
             break
-        resolved, mappings, pathways = run_query(query, state, top_k)
+        resolved, mappings, pathways, expanded = run_query(query, state, top_k)
         if resolved is None:
             print("No matching standard name found.")
             continue
-        print_result(query, resolved, mappings, pathways, top_k)
+        print_result(query, resolved, mappings, pathways, top_k, expanded)
 
 
 def main() -> None:
@@ -1507,11 +1577,11 @@ def main() -> None:
     workdir = Path(args.workdir).resolve()
     state = load_preprocessed_state(workdir)
     if args.name:
-        resolved, mappings, pathways = run_query(args.name, state, args.top_k)
+        resolved, mappings, pathways, expanded = run_query(args.name, state, args.top_k)
         if resolved is None:
             print("No matching standard name found.")
             return
-        print_result(args.name, resolved, mappings, pathways, args.top_k)
+        print_result(args.name, resolved, mappings, pathways, args.top_k, expanded)
         return
     repl(state, args.top_k)
 

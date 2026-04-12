@@ -224,6 +224,11 @@ class PipelinePaths:
     plant_reactome_gene_index_path: Path
     plant_reactome_alignment_path: Path
     plant_evidence_index_path: Path
+    expanded_candidates_path: Path
+    ml_training_pairs_path: Path
+    ml_pathway_predictions_path: Path
+    ml_model_path: Path
+    ml_model_metadata_path: Path
     preprocess_metadata_path: Path
     preprocessed_history_dir: Path
 
@@ -301,6 +306,11 @@ class PipelinePaths:
             plant_reactome_gene_index_path=preprocessed_dir / "plant_reactome_gene_index.tsv",
             plant_reactome_alignment_path=preprocessed_dir / "plant_reactome_alignment.tsv",
             plant_evidence_index_path=preprocessed_dir / "plant_evidence_index.tsv",
+            expanded_candidates_path=preprocessed_dir / "compound_to_external_pathway_candidates.tsv",
+            ml_training_pairs_path=preprocessed_dir / "ml_training_pairs.tsv",
+            ml_pathway_predictions_path=preprocessed_dir / "ml_pathway_predictions.tsv",
+            ml_model_path=preprocessed_dir / "models" / "pathway_expansion_model.joblib",
+            ml_model_metadata_path=preprocessed_dir / "ml_model_metadata.json",
             preprocess_metadata_path=preprocessed_dir / "preprocess_metadata.json",
             preprocessed_history_dir=preprocessed_history_dir,
         )
@@ -412,6 +422,9 @@ class PipelineContext:
     plant_reactome_vstamp: str = ""
     preprocess_counts: Counter[str] = field(default_factory=Counter)
     preprocess_version: str = ""
+
+    expanded_candidates_count: int = 0
+    ml_predictions_count: int = 0
 
     step_notes: list[str] = field(default_factory=list)
 

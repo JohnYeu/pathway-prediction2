@@ -37,8 +37,6 @@ from urllib.request import urlopen
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from process_chebi_to_pathways_v2 import load_kegg_pathway_links
-
 from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
 from pathway_pipeline.context import PipelineContext, Step3PathwayHit
 from pathway_pipeline.step1_alias_standardization import run as run_step1
@@ -162,6 +160,24 @@ def read_tsv_pairs(path: Path, left_prefix: str, right_prefix: str) -> list[tupl
             if left_id and right_id:
                 pairs.append((left_id, right_id))
     return pairs
+
+
+def load_kegg_pathway_links(
+    path: Path,
+    map_to_ath: dict[str, str],
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, int]]:
+    """Load KEGG compound -> pathway links and precompute pathway sizes."""
+
+    links: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
+    map_pathway_compound_counts: Counter[str] = Counter()
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            compound_ref, pathway_ref = line.rstrip("\n").split("\t", 1)
+            kegg_compound_id = compound_ref.replace("cpd:", "")
+            map_pathway_id = pathway_ref.replace("path:", "")
+            links[kegg_compound_id].append((map_pathway_id, map_to_ath.get(map_pathway_id, "")))
+            map_pathway_compound_counts[map_pathway_id] += 1
+    return dict(links), dict(map_pathway_compound_counts)
 
 
 def parse_kegg_entry_blocks(raw_text: str) -> list[dict[str, list[str]]]:

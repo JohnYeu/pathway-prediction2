@@ -716,137 +716,54 @@ def ensure_exists(path: Path) -> None:
 
 
 def load_compounds(path: Path) -> dict[str, ChEBICompound]:
-    """Load the local ChEBI compound table into memory."""
+    """Compatibility wrapper for the step-1-owned compound loader."""
 
-    compounds: dict[str, ChEBICompound] = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            compounds[row["id"]] = ChEBICompound(
-                compound_id=row["id"],
-                chebi_accession=row["chebi_accession"],
-                name=row["name"],
-                ascii_name=row["ascii_name"],
-                definition=row["definition"],
-                stars=int(row["stars"] or 0),
-                status_id=row["status_id"],
-            )
-    return compounds
+    from pathway_pipeline.step1_alias_standardization import load_compounds as _impl
+
+    return _impl(path)
 
 
 def load_comments_profile(path: Path) -> dict[str, int]:
-    """Profile comments.tsv so the summary can explain why it is not used."""
+    """Compatibility wrapper for the step-1-owned comments profiler."""
 
-    counter: Counter[str] = Counter()
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            counter[row["datatype"] or "<empty>"] += 1
-    return dict(counter.most_common())
+    from pathway_pipeline.step1_alias_standardization import load_comments_profile as _impl
+
+    return _impl(path)
 
 
 def load_base_aliases(
     compounds: dict[str, ChEBICompound],
     names_path: Path,
 ) -> dict[str, list[AliasRecord]]:
-    """Build the initial alias table from ChEBI primary names and names.tsv.
+    """Compatibility wrapper for the step-1-owned base alias loader."""
 
-    This stage intentionally stays close to ChEBI itself. External synonym
-    sources are added later only after we know which records they plausibly
-    belong to.
-    """
+    from pathway_pipeline.step1_alias_standardization import load_base_aliases as _impl
 
-    aliases: dict[str, dict[str, AliasRecord]] = {compound_id: {} for compound_id in compounds}
-    for compound_id, compound in compounds.items():
-        record_alias(aliases[compound_id], raw_name=compound.name, source_type="compound_name", language_code="en")
-        if compound.ascii_name and compound.ascii_name != compound.name:
-            record_alias(aliases[compound_id], raw_name=compound.ascii_name, source_type="ascii_name", language_code="en")
-
-    with gzip.open(names_path, "rt", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            compound_id = row["compound_id"]
-            if compound_id not in aliases:
-                continue
-            if row["type"] not in ALLOWED_CHEBI_ALIAS_TYPES:
-                continue
-            if row["language_code"] not in {"", "en"}:
-                continue
-            source_type = {
-                "SYNONYM": "chebi_synonym",
-                "IUPAC NAME": "chebi_iupac",
-                "INN": "chebi_inn",
-            }[row["type"]]
-            record_alias(aliases[compound_id], raw_name=row["name"], source_type=source_type, language_code=row["language_code"])
-            if row["ascii_name"] and row["ascii_name"] != row["name"]:
-                record_alias(aliases[compound_id], raw_name=row["ascii_name"], source_type=source_type, language_code=row["language_code"])
-
-    return {compound_id: list(alias_map.values()) for compound_id, alias_map in aliases.items()}
+    return _impl(compounds, names_path)
 
 
 def load_xrefs(path: Path) -> dict[str, XrefInfo]:
-    """Load curated external identifiers from ChEBI database_accession."""
+    """Compatibility wrapper for the step-1-owned xref loader."""
 
-    xrefs: defaultdict[str, XrefInfo] = defaultdict(XrefInfo)
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            compound_id = row["compound_id"]
-            accession = row["accession_number"].strip()
-            source_id = row["source_id"]
-            xref = xrefs[compound_id]
-            if source_id == "45" and KEGG_ID_RE.fullmatch(accession):
-                xref.kegg_ids.add(accession)
-            elif source_id == "68" and row["type"] == "MANUAL_X_REF" and PUBCHEM_CID_RE.fullmatch(accession):
-                xref.pubchem_cids.add(accession)
-            elif source_id == "35" and accession:
-                xref.hmdb_ids.add(accession if accession.upper().startswith("HMDB") else f"HMDB:{accession}")
-            elif source_id == "19" and accession:
-                xref.chemspider_ids.add(accession)
-    return dict(xrefs)
+    from pathway_pipeline.step1_alias_standardization import load_xrefs as _impl
+
+    return _impl(path)
 
 
 def load_formula_info(path: Path) -> dict[str, tuple[str, str]]:
-    """Load preferred molecular formula/mass records for each ChEBI compound."""
+    """Compatibility wrapper for the step-1-owned formula loader."""
 
-    formulas: dict[str, tuple[str, str]] = {}
-    preferred_status: dict[str, int] = {}
-    with gzip.open(path, "rt", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            compound_id = row["compound_id"]
-            status_rank = 0 if row["status_id"] == "1" else 1
-            if compound_id in formulas and status_rank >= preferred_status[compound_id]:
-                continue
-            formulas[compound_id] = (row["formula"] or "", row["monoisotopic_mass"] or "")
-            preferred_status[compound_id] = status_rank
-    return formulas
+    from pathway_pipeline.step1_alias_standardization import load_formula_info as _impl
+
+    return _impl(path)
 
 
 def load_structures(path: Path, formulas: dict[str, tuple[str, str]]) -> dict[str, StructureInfo]:
-    """Load the preferred ChEBI structure row and attach formula metadata."""
+    """Compatibility wrapper for the step-1-owned structure loader."""
 
-    structures: dict[str, StructureInfo] = {}
-    preferred_default: dict[str, int] = {}
-    with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            compound_id = row["compound_id"]
-            is_default = 0 if row["default_structure"].lower() == "true" else 1
-            if compound_id in structures and is_default >= preferred_default[compound_id]:
-                continue
-            formula, monoisotopic_mass = formulas.get(compound_id, ("", ""))
-            structures[compound_id] = StructureInfo(
-                compound_id=compound_id,
-                smiles=row["smiles"] or "",
-                standard_inchi=row["standard_inchi"] or "",
-                standard_inchi_key=row["standard_inchi_key"] or "",
-                formula=formula,
-                formula_key=formula_key(formula),
-                monoisotopic_mass=monoisotopic_mass,
-            )
-            preferred_default[compound_id] = is_default
-    return structures
+    from pathway_pipeline.step1_alias_standardization import load_structures as _impl
+
+    return _impl(path, formulas)
 
 
 def build_name_formula_index(
@@ -855,36 +772,11 @@ def build_name_formula_index(
     plantcyc_records: dict[str, PlantCycCompound],
     lipidmaps_records: dict[str, LipidMapsRecord],
 ) -> dict[str, set[str]]:
-    """Create a compact-name -> formula-set lookup used by fuzzy validation.
+    """Compatibility wrapper for the step-1-owned formula validation index."""
 
-    The key design choice is that fuzzy name similarity alone is never trusted.
-    When a near-name candidate is found later, this index is consulted to see
-    whether both names can be associated with the same molecular formula.
-    """
+    from pathway_pipeline.step1_alias_standardization import build_name_formula_index as _impl
 
-    index: defaultdict[str, set[str]] = defaultdict(set)
-    for compound_id, aliases in base_aliases.items():
-        structure = structures.get(compound_id)
-        if not structure or not structure.formula_key:
-            continue
-        for alias in aliases:
-            if alias.compact:
-                index[alias.compact].add(structure.formula_key)
-    for record in plantcyc_records.values():
-        if not record.formula_key:
-            continue
-        for name in [record.common_name, *sorted(record.synonyms)]:
-            compact = build_variants(name)["compact"]
-            if compact:
-                index[compact].add(record.formula_key)
-    for record in lipidmaps_records.values():
-        if not record.formula_key:
-            continue
-        for name in [record.common_name, record.systematic_name, *sorted(record.synonyms)]:
-            compact = build_variants(name)["compact"]
-            if compact:
-                index[compact].add(record.formula_key)
-    return dict(index)
+    return _impl(base_aliases, structures, plantcyc_records, lipidmaps_records)
 
 
 def normalize_inchi_key(value: str) -> str:
@@ -918,92 +810,22 @@ def build_kegg_structure_indexes(
     structures: dict[str, StructureInfo],
     xrefs: dict[str, XrefInfo],
     lipidmaps_records: dict[str, LipidMapsRecord],
-) -> dict[str, dict[str, set[str]]]:
-    """Build exact InChIKey -> KEGG compound evidence.
+) -> dict[str, dict[str, dict[str, set[str]]]]:
+    """Compatibility wrapper for the step-2-owned KEGG structure bridge logic."""
 
-    The goal is to let step 2 prefer true structure identity before any
-    name-based correction. The index intentionally stores provenance labels so
-    later scoring can explain whether the KEGG structure link came from curated
-    ChEBI->KEGG xrefs or from external structure-bearing resources such as
-    LIPID MAPS.
-    """
+    from pathway_pipeline.step2_map_names_to_kegg import build_kegg_structure_indexes as _impl
 
-    by_inchi_key_full: defaultdict[str, defaultdict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-    by_smiles_norm: defaultdict[str, defaultdict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-
-    for compound_id, info in xrefs.items():
-        structure = structures.get(compound_id)
-        if not structure:
-            continue
-        inchi_key = normalize_inchi_key(structure.standard_inchi_key)
-        smiles_norm = canonicalize_smiles(structure.smiles)
-        for kegg_id in info.kegg_ids:
-            if not KEGG_ID_RE.fullmatch(kegg_id):
-                continue
-            if inchi_key:
-                by_inchi_key_full[inchi_key][kegg_id].add("ChEBI")
-            if smiles_norm:
-                by_smiles_norm[smiles_norm][kegg_id].add("ChEBI")
-
-    for record in lipidmaps_records.values():
-        inchi_key = normalize_inchi_key(record.inchi_key)
-        if not inchi_key:
-            smiles_norm = canonicalize_smiles(record.smiles)
-        else:
-            smiles_norm = canonicalize_smiles(record.smiles)
-        for kegg_id in record.kegg_ids:
-            if not KEGG_ID_RE.fullmatch(kegg_id):
-                continue
-            if inchi_key:
-                by_inchi_key_full[inchi_key][kegg_id].add("LIPID MAPS")
-            if smiles_norm:
-                by_smiles_norm[smiles_norm][kegg_id].add("LIPID MAPS")
-
-    return {
-        "by_inchi_key_full": {
-            inchi_key: {kegg_id: set(sources) for kegg_id, sources in hits.items()}
-            for inchi_key, hits in by_inchi_key_full.items()
-        },
-        "by_smiles_norm": {
-            smiles_norm: {kegg_id: set(sources) for kegg_id, sources in hits.items()}
-            for smiles_norm, hits in by_smiles_norm.items()
-        },
-    }
+    return _impl(structures, xrefs, lipidmaps_records)
 
 
 def build_plantcyc_compound_index(
     plantcyc_records: dict[str, PlantCycCompound],
 ) -> list[dict[str, object]]:
-    """Flatten PMN compound rows into an audit/index table for step 2."""
+    """Compatibility wrapper for the step-2-owned PMN audit table builder."""
 
-    rows: list[dict[str, object]] = []
-    for record_id in sorted(plantcyc_records):
-        record = plantcyc_records[record_id]
-        variants = build_variants(record.common_name)
-        rows.append(
-            {
-                "plant_db": record.source_db,
-                "plant_compound_id": record.compound_id,
-                "canonical_name": record.common_name,
-                "name_norm_exact": variants["exact"],
-                "name_norm_compact": variants["compact"],
-                "name_norm_singular": variants["singular"],
-                "synonym_list": ";".join(sorted(record.synonyms)),
-                "formula": record.formula,
-                "formula_key": record.formula_key,
-                "smiles_raw": record.smiles,
-                "smiles_norm": canonicalize_smiles(record.smiles),
-                "inchi_key_full": "",
-                "chebi_ids": ";".join(sorted(record.chebi_ids)),
-                "pubchem_cids": ";".join(sorted(record.pubchem_cids)),
-                "kegg_ids": ";".join(sorted(record.kegg_ids)),
-                "hmdb_ids": ";".join(sorted(record.hmdb_ids)),
-                "pathway_count": len(record.pathways),
-                "pathway_examples": ";".join(sorted(record.pathways)[:3]),
-                "arabidopsis_supported": str(record.source_db == "AraCyc").lower(),
-            }
-        )
-    return rows
+    from pathway_pipeline.step2_map_names_to_kegg import build_plantcyc_compound_index as _impl
+
+    return _impl(plantcyc_records)
 
 
 def build_kegg_structure_index(
@@ -1011,39 +833,11 @@ def build_kegg_structure_index(
     xrefs: dict[str, XrefInfo],
     lipidmaps_records: dict[str, LipidMapsRecord],
 ) -> list[dict[str, object]]:
-    """Flatten the KEGG structure bridge table used by PMN structure rescue."""
+    """Compatibility wrapper for the step-2-owned KEGG structure table writer."""
 
-    rows: list[dict[str, object]] = []
-    indexes = build_kegg_structure_indexes(structures, xrefs, lipidmaps_records)
-    merged: dict[tuple[str, str, str], set[str]] = {}
+    from pathway_pipeline.step2_map_names_to_kegg import build_kegg_structure_index as _impl
 
-    for inchi_key, hits in indexes.get("by_inchi_key_full", {}).items():
-        for kegg_cid, sources in hits.items():
-            key = (kegg_cid, inchi_key, "")
-            merged.setdefault(key, set()).update(sources)
-
-    for smiles_norm, hits in indexes.get("by_smiles_norm", {}).items():
-        for kegg_cid, sources in hits.items():
-            matched_key = None
-            for key in merged:
-                if key[0] == kegg_cid and key[2] == smiles_norm:
-                    matched_key = key
-                    break
-            if matched_key is None:
-                matched_key = (kegg_cid, "", smiles_norm)
-            merged.setdefault(matched_key, set()).update(sources)
-
-    for (kegg_cid, inchi_key, smiles_norm), sources in sorted(merged.items()):
-        rows.append(
-            {
-                "kegg_cid": kegg_cid,
-                "inchi_key_full": inchi_key,
-                "smiles_norm": smiles_norm,
-                "source_dbs": ";".join(sorted(sources)),
-                "source_count": len(sources),
-            }
-        )
-    return rows
+    return _impl(structures, xrefs, lipidmaps_records)
 
 
 def _build_chebi_to_kegg_bridge_index(
@@ -1083,13 +877,11 @@ def _build_pubchem_to_kegg_bridge_index(
 
 
 def bridge_confidence_label(score: float) -> str:
-    """Bucket PMN->KEGG bridge scores into coarse confidence levels."""
+    """Compatibility wrapper for the step-2-owned PMN bridge label helper."""
 
-    if score >= 0.93:
-        return "high"
-    if score >= 0.88:
-        return "medium"
-    return "low"
+    from pathway_pipeline.step2_map_names_to_kegg import bridge_confidence_label as _impl
+
+    return _impl(score)
 
 
 def build_plant_to_kegg_bridge(
@@ -1101,135 +893,18 @@ def build_plant_to_kegg_bridge(
     pubchem_to_kegg_index: dict[str, set[str]],
     kegg_structure_indexes: dict[str, dict[str, dict[str, set[str]]]],
 ) -> list[PlantToKeggBridge]:
-    """Bridge matched PMN records back to KEGG using curated and structural evidence."""
+    """Compatibility wrapper for the step-2-owned PMN -> KEGG bridge logic."""
 
-    bridges: dict[tuple[str, str], dict[str, object]] = {}
+    from pathway_pipeline.step2_map_names_to_kegg import build_plant_to_kegg_bridge as _impl
 
-    for record_id, matched_methods in sorted(context.matched_plantcyc_methods.items()):
-        record = plantcyc_records[record_id]
-        arabidopsis_supported = record.source_db == "AraCyc"
-
-        def add_bridge(
-            *,
-            kegg_cid: str,
-            bridge_method: str,
-            supporting_ids: list[str],
-            has_structure_evidence: bool,
-            bridge_reason: str,
-        ) -> None:
-            if not KEGG_ID_RE.fullmatch(kegg_cid):
-                return
-            key = (record.record_id, kegg_cid)
-            base_score = PLANT_BRIDGE_BASE_SCORES[(bridge_method, record.source_db)]
-            extra_sources = 0
-            if bridge_method != "plant_direct_kegg_xref" and record.kegg_ids:
-                extra_sources += 1
-            if bridge_method != "plant_via_chebi" and record.chebi_ids:
-                extra_sources += 1
-            if bridge_method != "plant_via_pubchem" and record.pubchem_cids:
-                extra_sources += 1
-            bridge_score = min(base_score + min(extra_sources, 3) * 0.01, base_score + 0.03)
-            existing = bridges.get(key)
-            if existing and float(existing["bridge_score"]) >= bridge_score:
-                existing["bridge_record_ids"].add(record.record_id)
-                existing["supporting_ids"].update(supporting_ids)
-                existing["bridge_reason"].add(bridge_reason)
-                return
-            bridges[key] = {
-                "compound_id": compound.compound_id,
-                "chebi_accession": compound.chebi_accession,
-                "canonical_name": compound.name,
-                "plant_db": record.source_db,
-                "plant_compound_id": record.compound_id,
-                "kegg_cid": kegg_cid,
-                "bridge_method": bridge_method,
-                "bridge_score": bridge_score,
-                "bridge_record_ids": {record.record_id},
-                "supporting_ids": set(supporting_ids),
-                "arabidopsis_supported": arabidopsis_supported,
-                "has_structure_evidence": has_structure_evidence,
-                "bridge_reason": {bridge_reason},
-            }
-
-        for kegg_cid in sorted(record.kegg_ids):
-            add_bridge(
-                kegg_cid=kegg_cid,
-                bridge_method="plant_direct_kegg_xref",
-                supporting_ids=[f"KEGG:{kegg_cid}"],
-                has_structure_evidence=False,
-                bridge_reason=f"{record.source_db} record {record.compound_id} carries direct KEGG link {kegg_cid}",
-            )
-
-        for chebi_id in sorted(record.chebi_ids):
-            for kegg_cid in sorted(chebi_to_kegg_index.get(chebi_id, set())):
-                add_bridge(
-                    kegg_cid=kegg_cid,
-                    bridge_method="plant_via_chebi",
-                    supporting_ids=[chebi_id],
-                    has_structure_evidence=False,
-                    bridge_reason=f"{record.source_db} record {record.compound_id} bridges to {kegg_cid} via {chebi_id}",
-                )
-
-        record_inchi_key = ""
-        if record.smiles and Chem is not None:
-            try:
-                mol = Chem.MolFromSmiles(record.smiles)
-                if mol is not None:
-                    record_inchi_key = normalize_inchi_key(Chem.MolToInchiKey(mol))
-            except Exception:
-                record_inchi_key = ""
-        if record_inchi_key:
-            for kegg_cid, sources in sorted(kegg_structure_indexes.get("by_inchi_key_full", {}).get(record_inchi_key, {}).items()):
-                add_bridge(
-                    kegg_cid=kegg_cid,
-                    bridge_method="plant_inchikey_exact",
-                    supporting_ids=[f"InChIKey:{record_inchi_key}"],
-                    has_structure_evidence=True,
-                    bridge_reason=f"{record.source_db} record {record.compound_id} exact InChIKey matches {kegg_cid} via {','.join(sorted(sources))}",
-                )
-
-        for cid in sorted(record.pubchem_cids):
-            for kegg_cid in sorted(pubchem_to_kegg_index.get(cid, set())):
-                add_bridge(
-                    kegg_cid=kegg_cid,
-                    bridge_method="plant_via_pubchem",
-                    supporting_ids=[f"PUBCHEM:{cid}"],
-                    has_structure_evidence=False,
-                    bridge_reason=f"{record.source_db} record {record.compound_id} bridges to {kegg_cid} via PUBCHEM:{cid}",
-                )
-
-        smiles_norm = canonicalize_smiles(record.smiles)
-        if smiles_norm:
-            for kegg_cid, sources in sorted(kegg_structure_indexes.get("by_smiles_norm", {}).get(smiles_norm, {}).items()):
-                add_bridge(
-                    kegg_cid=kegg_cid,
-                    bridge_method="plant_smiles_exact",
-                    supporting_ids=[f"SMILES:{smiles_norm}"],
-                    has_structure_evidence=True,
-                    bridge_reason=f"{record.source_db} record {record.compound_id} canonical SMILES matches {kegg_cid} via {','.join(sorted(sources))}",
-                )
-
-    rows: list[PlantToKeggBridge] = []
-    for (_record_id, _kegg_cid), row in sorted(bridges.items(), key=lambda item: (item[0][1], -item[1]["bridge_score"], item[0][0])):
-        rows.append(
-            PlantToKeggBridge(
-                compound_id=row["compound_id"],
-                chebi_accession=row["chebi_accession"],
-                canonical_name=row["canonical_name"],
-                plant_db=row["plant_db"],
-                plant_compound_id=row["plant_compound_id"],
-                kegg_cid=row["kegg_cid"],
-                bridge_method=row["bridge_method"],
-                bridge_score=float(row["bridge_score"]),
-                bridge_confidence=bridge_confidence_label(float(row["bridge_score"])),
-                bridge_record_ids=tuple(sorted(row["bridge_record_ids"])),
-                supporting_ids=tuple(sorted(row["supporting_ids"])),
-                arabidopsis_supported=bool(row["arabidopsis_supported"]),
-                has_structure_evidence=bool(row["has_structure_evidence"]),
-                bridge_reason="; ".join(sorted(row["bridge_reason"])),
-            )
-        )
-    return rows
+    return _impl(
+        compound=compound,
+        context=context,
+        plantcyc_records=plantcyc_records,
+        chebi_to_kegg_index=chebi_to_kegg_index,
+        pubchem_to_kegg_index=pubchem_to_kegg_index,
+        kegg_structure_indexes=kegg_structure_indexes,
+    )
 
 
 def load_kegg_compounds(
@@ -1348,80 +1023,46 @@ def load_kegg_compounds(
 
 
 def load_ath_pathways(path: Path) -> tuple[dict[str, str], dict[str, str]]:
-    """Load ath pathway names and a mapXXXX -> athXXXX conversion table."""
+    """Compatibility wrapper for the step-4-owned ath conversion loader."""
 
-    ath_pathways: dict[str, str] = {}
-    map_to_ath: dict[str, str] = {}
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            pathway_id, raw_name = line.rstrip("\n").split("\t", 1)
-            pathway_name = raw_name.split(" - ", 1)[0]
-            ath_pathways[pathway_id] = pathway_name
-            map_to_ath[f"map{pathway_id[3:]}"] = pathway_id
-    return ath_pathways, map_to_ath
+    from pathway_pipeline.step4_map_to_ath import load_ath_pathways as _impl
+
+    return _impl(path)
 
 
 def load_map_pathways(path: Path) -> dict[str, str]:
-    """Load KEGG reference pathway names keyed by map IDs."""
+    """Compatibility wrapper for the step-5-owned KEGG map loader."""
 
-    map_pathways: dict[str, str] = {}
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            pathway_id, pathway_name = line.rstrip("\n").split("\t", 1)
-            map_pathways[pathway_id] = pathway_name
-    return map_pathways
+    from pathway_pipeline.step5_annotate_pathways import load_map_pathways as _impl
+
+    return _impl(path)
 
 
 def load_pathway_categories(path: Path) -> dict[str, tuple[str, str, str]]:
-    """Parse KEGG pathway hierarchy into group/category/name triples."""
+    """Compatibility wrapper for the step-5-owned BRITE parser."""
 
-    categories: dict[str, tuple[str, str, str]] = {}
-    top_level = ""
-    sub_level = ""
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            line = line.rstrip("\n")
-            if line.startswith("A"):
-                top_level = line[1:].strip()
-                continue
-            if line.startswith("B"):
-                sub_level = line[1:].strip()
-                continue
-            match = PATHWAY_LINE_RE.match(line)
-            if match:
-                pathway_code, pathway_name = match.groups()
-                categories[f"map{pathway_code}"] = (top_level, sub_level, pathway_name)
-    return categories
+    from pathway_pipeline.step5_annotate_pathways import load_pathway_categories as _impl
+
+    return _impl(path)
 
 
 def load_kegg_pathway_links(
     path: Path,
     map_to_ath: dict[str, str],
 ) -> tuple[dict[str, list[tuple[str, str]]], dict[str, int]]:
-    """Load KEGG compound -> pathway links and precompute pathway sizes."""
+    """Compatibility wrapper for the step-3-owned KEGG pathway linker."""
 
-    links: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
-    map_pathway_compound_counts: Counter[str] = Counter()
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            compound_ref, pathway_ref = line.rstrip("\n").split("\t", 1)
-            kegg_compound_id = compound_ref.replace("cpd:", "")
-            map_pathway_id = pathway_ref.replace("path:", "")
-            links[kegg_compound_id].append((map_pathway_id, map_to_ath.get(map_pathway_id, "")))
-            map_pathway_compound_counts[map_pathway_id] += 1
-    return dict(links), dict(map_pathway_compound_counts)
+    from pathway_pipeline.step3_link_compounds_to_pathways import load_kegg_pathway_links as _impl
+
+    return _impl(path, map_to_ath)
 
 
 def load_ath_gene_counts(path: Path) -> dict[str, int]:
-    """Count how many ath genes are linked to each ath pathway."""
+    """Compatibility wrapper for the step-5-owned ath gene counter."""
 
-    genes_by_pathway: defaultdict[str, set[str]] = defaultdict(set)
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            gene_ref, pathway_ref = line.rstrip("\n").split("\t", 1)
-            pathway_id = pathway_ref.replace("path:", "")
-            genes_by_pathway[pathway_id].add(gene_ref.replace("ath:", ""))
-    return {pathway_id: len(genes) for pathway_id, genes in genes_by_pathway.items()}
+    from pathway_pipeline.step5_annotate_pathways import load_ath_gene_counts as _impl
+
+    return _impl(path)
 
 
 def parse_links_field(text: str) -> dict[str, set[str]]:
@@ -1460,80 +1101,19 @@ def load_plantcyc_compounds(
     dict[str, defaultdict[str, set[str]]],
     set[str],
 ]:
-    """Load AraCyc/PlantCyc compound exports and build cross-ID indexes."""
+    """Compatibility wrapper for the step-1-owned PMN compound loader."""
 
-    records: dict[str, PlantCycCompound] = {}
-    all_pubchem_cids: set[str] = set()
-    for source_db, path in files:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            for row in reader:
-                record_id = f"{source_db}:{row['Compound_id']}"
-                record = records.get(record_id)
-                if record is None:
-                    record = PlantCycCompound(
-                        record_id=record_id,
-                        source_db=source_db,
-                        compound_id=row["Compound_id"],
-                        common_name=row["Compound_common_name"] or row["Compound_id"],
-                        formula=row["Chemical_formula"] or "",
-                        formula_key=formula_key(row["Chemical_formula"] or ""),
-                        smiles=row["Smiles"] or "",
-                    )
-                    records[record_id] = record
-                record.synonyms.update(split_multi_value(row["Compound_synonyms"]))
-                if row["Pathway"]:
-                    record.pathways.add(row["Pathway"])
-                parsed_links = parse_links_field(row["Links"] or "")
-                record.chebi_ids.update(parsed_links["chebi_ids"])
-                record.pubchem_cids.update(parsed_links["pubchem_cids"])
-                record.kegg_ids.update(parsed_links["kegg_ids"])
-                record.hmdb_ids.update(parsed_links["hmdb_ids"])
-                all_pubchem_cids.update(parsed_links["pubchem_cids"])
+    from pathway_pipeline.step1_alias_standardization import load_plantcyc_compounds as _impl
 
-    indexes = {
-        "by_chebi": defaultdict(set),
-        "by_pubchem": defaultdict(set),
-        "by_kegg": defaultdict(set),
-        "by_name": defaultdict(set),
-    }
-    for record_id, record in records.items():
-        for chebi_id in record.chebi_ids:
-            indexes["by_chebi"][chebi_id].add(record_id)
-        for cid in record.pubchem_cids:
-            indexes["by_pubchem"][cid].add(record_id)
-        for kegg_id in record.kegg_ids:
-            indexes["by_kegg"][kegg_id].add(record_id)
-        names = [record.common_name, *sorted(record.synonyms)]
-        for name in names:
-            normalized = normalize_name(name)
-            if normalized:
-                indexes["by_name"][normalized].add(record_id)
-    return records, indexes, all_pubchem_cids
+    return _impl(files)
 
 
 def load_plantcyc_pathway_stats(files: list[tuple[str, Path]]) -> dict[str, dict[str, dict[str, object]]]:
-    """Collect lightweight pathway support summaries from PMN exports."""
+    """Compatibility wrapper for the step-5-owned PMN pathway stats loader."""
 
-    stats = {"AraCyc": {}, "PlantCyc": {}}
-    for source_db, path in files:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            for row in reader:
-                pathway_name = row["Pathway-name"] or ""
-                normalized = normalize_name(pathway_name)
-                if not normalized:
-                    continue
-                entry = stats[source_db].setdefault(
-                    normalized,
-                    {"names": set(), "pathway_ids": set(), "gene_ids": set()},
-                )
-                entry["names"].add(pathway_name)
-                if row["Pathway-id"]:
-                    entry["pathway_ids"].add(row["Pathway-id"])
-                if row["Gene-id"]:
-                    entry["gene_ids"].add(row["Gene-id"])
-    return stats
+    from pathway_pipeline.step5_annotate_pathways import load_plantcyc_pathway_stats as _impl
+
+    return _impl(files)
 
 
 def parse_sdf_records_from_zip(path: Path):
@@ -1582,97 +1162,27 @@ def load_lipidmaps_records(
     dict[str, defaultdict[str, set[str]]],
     set[str],
 ]:
-    """Load the subset of LIPID MAPS fields needed for matching/support."""
+    """Compatibility wrapper for the step-1-owned LIPID MAPS loader."""
 
-    records: dict[str, LipidMapsRecord] = {}
-    all_pubchem_cids: set[str] = set()
-    for entry in parse_sdf_records_from_zip(path):
-        lm_id = entry.get("LM_ID", "").strip()
-        if not lm_id:
-            continue
-        record = LipidMapsRecord(
-            lm_id=lm_id,
-            common_name=entry.get("COMMON_NAME", "").strip(),
-            systematic_name=entry.get("SYSTEMATIC_NAME", "").strip(),
-            synonyms=set(split_multi_value(entry.get("SYNONYMS", ""))),
-            inchi_key=entry.get("INCHI_KEY", "").strip(),
-            smiles=entry.get("SMILES", "").strip(),
-            formula=entry.get("FORMULA", "").strip(),
-            formula_key=formula_key(entry.get("FORMULA", "")),
-            pubchem_cids={value for value in split_multi_value(entry.get("PUBCHEM_CID", "")) if PUBCHEM_CID_RE.fullmatch(value)},
-            kegg_ids={value for value in split_multi_value(entry.get("KEGG_ID", "")) if KEGG_ID_RE.fullmatch(value)},
-            hmdb_ids={value for value in split_multi_value(entry.get("HMDB_ID", "")) if value},
-            chebi_ids={normalize_chebi_id(value) for value in split_multi_value(entry.get("CHEBI_ID", "")) if normalize_chebi_id(value)},
-            category=entry.get("CATEGORY", "").strip(),
-            main_class=entry.get("MAIN_CLASS", "").strip(),
-            sub_class=entry.get("SUB_CLASS", "").strip(),
-        )
-        records[lm_id] = record
-        all_pubchem_cids.update(record.pubchem_cids)
+    from pathway_pipeline.step1_alias_standardization import load_lipidmaps_records as _impl
 
-    indexes = {
-        "by_chebi": defaultdict(set),
-        "by_pubchem": defaultdict(set),
-        "by_kegg": defaultdict(set),
-        "by_inchi_key": defaultdict(set),
-        "by_name": defaultdict(set),
-    }
-    for lm_id, record in records.items():
-        for chebi_id in record.chebi_ids:
-            indexes["by_chebi"][chebi_id].add(lm_id)
-        for cid in record.pubchem_cids:
-            indexes["by_pubchem"][cid].add(lm_id)
-        for kegg_id in record.kegg_ids:
-            indexes["by_kegg"][kegg_id].add(lm_id)
-        if record.inchi_key:
-            indexes["by_inchi_key"][record.inchi_key].add(lm_id)
-        names = [record.common_name, record.systematic_name, *sorted(record.synonyms)]
-        for name in names:
-            normalized = normalize_name(name)
-            if normalized:
-                indexes["by_name"][normalized].add(lm_id)
-    return records, indexes, all_pubchem_cids
+    return _impl(path)
 
 
 def load_pubchem_synonyms(path: Path, target_cids: set[str]) -> tuple[dict[str, list[str]], dict[str, int]]:
-    """Load only PubChem synonyms that are relevant to observed target CIDs."""
+    """Compatibility wrapper for the step-1-owned PubChem synonym loader."""
 
-    synonyms: defaultdict[str, list[str]] = defaultdict(list)
-    seen: defaultdict[str, set[str]] = defaultdict(set)
-    stats = {"target_cids": len(target_cids), "matched_lines": 0, "kept_synonyms": 0}
-    if not target_cids:
-        return {}, stats
-    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            cid, synonym = line.rstrip("\n").split("\t", 1)
-            if cid not in target_cids:
-                continue
-            stats["matched_lines"] += 1
-            synonym = synonym.strip()
-            if not keep_pubchem_synonym(synonym):
-                continue
-            normalized = normalize_name(synonym)
-            if not normalized or normalized in seen[cid]:
-                continue
-            if len(synonyms[cid]) >= MAX_PUBCHEM_SYNONYMS_PER_CID:
-                continue
-            synonyms[cid].append(synonym)
-            seen[cid].add(normalized)
-            stats["kept_synonyms"] += 1
-    return dict(synonyms), stats
+    from pathway_pipeline.step1_alias_standardization import load_pubchem_synonyms as _impl
+
+    return _impl(path, target_cids)
 
 
 def load_reactome_pathways(path: Path) -> dict[str, list[tuple[str, str]]]:
-    """Index Reactome pathways by normalized name for explanation support."""
+    """Compatibility wrapper for the step-5-owned Reactome name index."""
 
-    index: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            pathway_id, pathway_name, species = line.rstrip("\n").split("\t", 2)
-            normalized = normalize_name(pathway_name)
-            if normalized:
-                index[normalized].append((pathway_id, species))
-    return dict(index)
+    from pathway_pipeline.step5_annotate_pathways import load_reactome_pathways as _impl
+
+    return _impl(path)
 
 
 def fetch_text_with_fallback(url: str) -> str:
@@ -1716,9 +1226,11 @@ def download_binary_with_fallback(url: str, destination: Path) -> None:
 
 
 def iso_mtime(path: Path) -> str:
-    """Return a file's mtime in ISO-8601 UTC."""
+    """Compatibility wrapper for the step-5-owned file timestamp helper."""
 
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
+    from pathway_pipeline.step5_annotate_pathways import iso_mtime as _impl
+
+    return _impl(path)
 
 
 def load_go_basic_terms(path: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -1769,61 +1281,27 @@ def extract_agi_loci(*fields: str) -> set[str]:
 
 
 def ensure_go_annotations(path: Path) -> str:
-    """Download Arabidopsis GO annotations when the local snapshot is missing."""
+    """Compatibility wrapper for the step-5-owned GO snapshot loader."""
 
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        errors = []
-        for url in GO_TAIR_GAF_URLS:
-            try:
-                download_binary_with_fallback(url, path)
-                break
-            except Exception as exc:  # pragma: no cover - exercised only on flaky remote failures
-                errors.append(f"{url}: {exc}")
-        else:
-            raise RuntimeError("Unable to download Arabidopsis GO annotations from any configured source:\n" + "\n".join(errors))
-    return iso_mtime(path)
+    from pathway_pipeline.step5_annotate_pathways import ensure_go_annotations as _impl
+
+    return _impl(path)
 
 
 def load_gene_to_go_bp(gaf_path: Path, go_basic_path: Path) -> tuple[dict[str, set[tuple[str, str]]], dict[str, str], str]:
-    """Load Arabidopsis gene -> GO BP mappings from a TAIR GAF snapshot."""
+    """Compatibility wrapper for the step-5-owned GO gene index loader."""
 
-    go_names, go_namespaces = load_go_basic_terms(go_basic_path)
-    gene_to_go: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    with gzip.open(gaf_path, "rt", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line or line.startswith("!"):
-                continue
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 11:
-                continue
-            qualifier = fields[3]
-            go_id = fields[4]
-            aspect = fields[8]
-            if aspect != "P" or not GO_ID_RE.fullmatch(go_id):
-                continue
-            qualifiers = {item.strip().upper() for item in qualifier.split("|") if item.strip()}
-            if "NOT" in qualifiers:
-                continue
-            gene_ids = extract_agi_loci(fields[1], fields[2], fields[9], fields[10])
-            if not gene_ids:
-                continue
-            go_name = go_names.get(go_id, go_id)
-            for gene_id in gene_ids:
-                gene_to_go[gene_id].add((go_id, go_name))
-    return {gene: set(values) for gene, values in gene_to_go.items()}, go_namespaces, iso_mtime(gaf_path)
+    from pathway_pipeline.step5_annotate_pathways import load_gene_to_go_bp as _impl
+
+    return _impl(gaf_path, go_basic_path)
 
 
 def build_go_term_gene_sets(gene_to_go: dict[str, set[tuple[str, str]]]) -> tuple[dict[str, set[str]], dict[str, str]]:
-    """Invert a gene -> GO mapping into GO -> gene sets and GO names."""
+    """Compatibility wrapper for the step-5-owned GO inversion helper."""
 
-    term_to_genes: dict[str, set[str]] = defaultdict(set)
-    go_names: dict[str, str] = {}
-    for gene_id, terms in gene_to_go.items():
-        for go_id, go_name in terms:
-            term_to_genes[go_id].add(gene_id)
-            go_names[go_id] = go_name
-    return {go_id: set(genes) for go_id, genes in term_to_genes.items()}, go_names
+    from pathway_pipeline.step5_annotate_pathways import build_go_term_gene_sets as _impl
+
+    return _impl(gene_to_go)
 
 
 @lru_cache(maxsize=None)
@@ -1876,64 +1354,11 @@ def compute_pathway_go_enrichment(
     background_genes: set[str],
     top_k: int = 5,
 ) -> dict[str, object]:
-    """Compute GO BP enrichment for one pathway gene set."""
+    """Compatibility wrapper for the step-5-owned GO enrichment helper."""
 
-    pathway_genes = set(pathway_gene_ids) & background_genes
-    gene_count = len(pathway_genes)
-    background_gene_count = len(background_genes)
-    if gene_count < 3 or background_gene_count == 0:
-        return {
-            "gene_count": gene_count,
-            "background_gene_count": background_gene_count,
-            "terms": [],
-            "go_best_term": "",
-            "go_best_fdr": "",
-        }
+    from pathway_pipeline.step5_annotate_pathways import compute_pathway_go_enrichment as _impl
 
-    enrichment_rows = []
-    for go_id, genes in term_to_genes.items():
-        background_term_genes = genes & background_genes
-        if not background_term_genes:
-            continue
-        hit_genes = pathway_genes & background_term_genes
-        if not hit_genes:
-            continue
-        p_value = hypergeom_sf(
-            population_size=background_gene_count,
-            success_population=len(background_term_genes),
-            draw_count=gene_count,
-            observed_successes=len(hit_genes),
-        )
-        enrichment_rows.append(
-            {
-                "go_id": go_id,
-                "go_name": go_names.get(go_id, go_id),
-                "p_value": p_value,
-                "n_genes_hit": len(hit_genes),
-                "term_gene_count": len(background_term_genes),
-            }
-        )
-    if not enrichment_rows:
-        return {
-            "gene_count": gene_count,
-            "background_gene_count": background_gene_count,
-            "terms": [],
-            "go_best_term": "",
-            "go_best_fdr": "",
-        }
-
-    adjusted = benjamini_hochberg([row["p_value"] for row in enrichment_rows])
-    for row, fdr in zip(enrichment_rows, adjusted, strict=False):
-        row["fdr"] = fdr
-    enrichment_rows.sort(key=lambda row: (row["fdr"], -row["n_genes_hit"], row["go_name"]))
-    top_terms = enrichment_rows[:top_k]
-    return {
-        "gene_count": gene_count,
-        "background_gene_count": background_gene_count,
-        "terms": top_terms,
-        "go_best_term": top_terms[0]["go_name"] if top_terms else "",
-        "go_best_fdr": top_terms[0]["fdr"] if top_terms else "",
-    }
+    return _impl(pathway_gene_ids, term_to_genes, go_names, background_genes, top_k=top_k)
 
 
 def extract_identifier_strings(data) -> set[str]:
@@ -1980,122 +1405,27 @@ def ensure_plant_reactome_refs(
     gene_path: Path,
     version_path: Path,
 ) -> str:
-    """Download and materialize a local Plant Reactome snapshot if missing."""
+    """Compatibility wrapper for the step-5-owned Plant Reactome snapshotter."""
 
-    if pathways_path.exists() and gene_path.exists() and version_path.exists():
-        raw_text = version_path.read_text(encoding="utf-8").strip()
-        try:
-            payload = json.loads(raw_text)
-            return payload.get("vstamp", raw_text)
-        except json.JSONDecodeError:
-            return raw_text
+    from pathway_pipeline.step5_annotate_pathways import ensure_plant_reactome_refs as _impl
 
-    hierarchy = fetch_json_with_fallback(PLANT_REACTOME_HIERARCHY_URL)
-    pathway_rows = flatten_plant_reactome_hierarchy(hierarchy)
-    gene_rows = []
-    fetched_at = datetime.now(tz=UTC).isoformat()
-    release_dates: set[str] = set()
-
-    with pathways_path.open("w", newline="", encoding="utf-8") as pathway_handle, gene_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as gene_handle:
-        pathway_writer = csv.DictWriter(
-            pathway_handle,
-            fieldnames=[
-                "pathway_id",
-                "pathway_name",
-                "species",
-                "top_level_category",
-                "description",
-                "release_date",
-                "go_biological_process_id",
-                "go_biological_process_name",
-                "name_normalized",
-                "name_compact",
-            ],
-            delimiter="\t",
-        )
-        gene_writer = csv.DictWriter(
-            gene_handle,
-            fieldnames=["pathway_id", "gene_id"],
-            delimiter="\t",
-        )
-        pathway_writer.writeheader()
-        gene_writer.writeheader()
-
-        for pathway_id, base_row in sorted(pathway_rows.items()):
-            detail = fetch_json_with_fallback(PLANT_REACTOME_QUERY_URL.format(st_id=pathway_id))
-            participants = fetch_json_with_fallback(PLANT_REACTOME_PARTICIPANTS_URL.format(st_id=pathway_id))
-            release_date = detail.get("releaseDate", "")
-            if release_date:
-                release_dates.add(release_date)
-            go_process = detail.get("goBiologicalProcess") or {}
-            summaries = detail.get("summation") or []
-            description = ""
-            if summaries:
-                description = clean_markup(summaries[0].get("text", ""))
-            if not description:
-                description = clean_markup(go_process.get("definition", ""))
-            name_value = detail.get("displayName") or base_row["pathway_name"]
-            variants = build_variants(name_value)
-            pathway_writer.writerow(
-                {
-                    "pathway_id": pathway_id,
-                    "pathway_name": name_value,
-                    "species": detail.get("speciesName") or base_row["species"],
-                    "top_level_category": base_row["top_level_category"],
-                    "description": description,
-                    "release_date": release_date,
-                    "go_biological_process_id": go_process.get("accession", ""),
-                    "go_biological_process_name": go_process.get("displayName", ""),
-                    "name_normalized": variants["exact"],
-                    "name_compact": variants["compact"],
-                }
-            )
-            for gene_id in sorted(extract_identifier_strings(participants)):
-                gene_writer.writerow({"pathway_id": pathway_id, "gene_id": gene_id})
-                gene_rows.append((pathway_id, gene_id))
-
-    primary_release = sorted(release_dates)[-1] if release_dates else fetched_at[:10]
-    vstamp = f"plant_reactome_{normalize_name(primary_release).replace(' ', '-') or fetched_at[:10]}"
-    version_text = json.dumps(
-        {
-            "source": "plant_reactome_content_service",
-            "fetched_at": fetched_at,
-            "release_dates": sorted(release_dates),
-            "pathway_count": len(pathway_rows),
-            "gene_link_count": len(gene_rows),
-            "vstamp": vstamp,
-        },
-        ensure_ascii=False,
-    )
-    version_path.write_text(version_text, encoding="utf-8")
-    return vstamp
+    return _impl(pathways_path, gene_path, version_path)
 
 
 def load_plant_reactome_pathways(path: Path) -> dict[str, dict[str, str]]:
-    """Load the normalized Plant Reactome pathway snapshot."""
+    """Compatibility wrapper for the step-5-owned Plant Reactome pathway loader."""
 
-    pathways = {}
-    with path.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            pathways[row["pathway_id"]] = row
-    return pathways
+    from pathway_pipeline.step5_annotate_pathways import load_plant_reactome_pathways as _impl
+
+    return _impl(path)
 
 
 def load_plant_reactome_gene_index(path: Path) -> dict[str, set[str]]:
-    """Load Plant Reactome pathway -> gene associations."""
+    """Compatibility wrapper for the step-5-owned Plant Reactome gene loader."""
 
-    gene_index: dict[str, set[str]] = defaultdict(set)
-    with path.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            if row["gene_id"]:
-                gene_index[row["pathway_id"]].add(row["gene_id"].upper())
-    return {pathway_id: set(genes) for pathway_id, genes in gene_index.items()}
+    from pathway_pipeline.step5_annotate_pathways import load_plant_reactome_gene_index as _impl
+
+    return _impl(path)
 
 
 def token_sorensen_dice(left_text: str, right_text: str) -> float:
@@ -2120,33 +1450,20 @@ def infer_plant_context_tags(
     plant_reactome_texts: tuple[str, ...] = (),
     go_texts: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    """Infer compact plant-context tags from BRITE/name/PMN/Plant Reactome text."""
+    """Compatibility wrapper for the step-5-owned plant tag inference."""
 
-    normalized_text = " ".join(
-        normalize_name(text)
-        for text in (brite_l1, brite_l2, brite_l3, pathway_name, *plant_reactome_texts, *go_texts)
-        if text
+    from pathway_pipeline.step5_annotate_pathways import infer_plant_context_tags as _impl
+
+    return _impl(
+        brite_l1=brite_l1,
+        brite_l2=brite_l2,
+        brite_l3=brite_l3,
+        pathway_name=pathway_name,
+        has_aracyc=has_aracyc,
+        has_plantcyc=has_plantcyc,
+        plant_reactome_texts=plant_reactome_texts,
+        go_texts=go_texts,
     )
-    tags: list[str] = []
-    brite_l2_norm = normalize_name(brite_l2)
-    if normalize_name(brite_l1) == "metabolism":
-        if any(keyword in brite_l2_norm for keyword in PRIMARY_BRITE_KEYWORDS):
-            tags.append("primary_metabolism")
-        if any(keyword in brite_l2_norm for keyword in SECONDARY_BRITE_KEYWORDS) or any(keyword in normalized_text for keyword in SECONDARY_NAME_KEYWORDS):
-            tags.append("secondary_metabolism")
-    if any(keyword in normalized_text for keyword in HORMONE_KEYWORDS):
-        tags.append("hormone_related")
-    if any(keyword in normalized_text for keyword in STRESS_KEYWORDS):
-        tags.append("stress_related")
-    if any(keyword in normalized_text for keyword in DEVELOPMENT_KEYWORDS):
-        tags.append("development_related")
-    if any(keyword in normalized_text for keyword in TRANSPORT_KEYWORDS):
-        tags.append("transport_related")
-    if not tags and has_aracyc and normalize_name(brite_l1) == "metabolism":
-        tags.append("primary_metabolism")
-    elif not tags and has_plantcyc and normalize_name(brite_l1) == "metabolism":
-        tags.append("primary_metabolism")
-    return tuple(tag for tag in PLANT_CONTEXT_TAGS if tag in set(tags))
 
 
 def plant_reactome_category_bonus(
@@ -2192,81 +1509,20 @@ def match_plant_reactome_context(
     plant_reactome_gene_sets: dict[str, set[str]],
     top_k: int = 3,
 ) -> list[dict[str, object]]:
-    """Match one KEGG pathway against Plant Reactome by name and gene overlap."""
+    """Compatibility wrapper for the step-5-owned Plant Reactome matcher."""
 
-    normalized_name = normalize_name(pathway_name)
-    compact_name = build_variants(pathway_name)["compact"]
-    ranked = []
-    for pathway_id, row in plant_reactome_pathways.items():
-        reactome_name = row["pathway_name"]
-        reactome_name_norm = row.get("name_normalized", normalize_name(reactome_name))
-        reactome_name_compact = row.get("name_compact", build_variants(reactome_name)["compact"])
-        reactome_genes = plant_reactome_gene_sets.get(pathway_id, set())
-        overlap_count = len(gene_ids & reactome_genes)
-        gene_union = len(gene_ids | reactome_genes)
-        gene_jaccard = overlap_count / gene_union if gene_union else 0.0
-        overlap_ratio_kegg = overlap_count / len(gene_ids) if gene_ids else 0.0
-        if normalized_name and normalized_name == reactome_name_norm:
-            name_similarity = 1.0
-        elif compact_name and compact_name == reactome_name_compact:
-            name_similarity = 0.97
-        else:
-            name_similarity = token_sorensen_dice(pathway_name, reactome_name)
-        arabidopsis_bonus = 1.0 if row.get("species", "") == "Arabidopsis thaliana" else 0.0
-        category_bonus = plant_reactome_category_bonus(
-            brite_l1=brite_l1,
-            brite_l2=brite_l2,
-            brite_l3=brite_l3,
-            pathway_name=pathway_name,
-            reactome_name=reactome_name,
-            reactome_category=row.get("top_level_category", ""),
-            reactome_description=row.get("description", ""),
-        )
-        if not (
-            (normalized_name and normalized_name == reactome_name_norm)
-            or (compact_name and compact_name == reactome_name_compact)
-            or overlap_count >= 2
-            or gene_jaccard >= 0.05
-        ):
-            continue
-        alignment_score = (
-            0.50 * gene_jaccard
-            + 0.20 * overlap_ratio_kegg
-            + 0.15 * name_similarity
-            + 0.10 * arabidopsis_bonus
-            + 0.05 * category_bonus
-        )
-        if alignment_score >= 0.55 and overlap_count >= 3:
-            confidence = "high"
-        elif alignment_score >= 0.35 and overlap_count >= 2:
-            confidence = "medium"
-        else:
-            confidence = "low"
-        ranked.append(
-            {
-                "plant_reactome_id": pathway_id,
-                "pathway_name": reactome_name,
-                "species": row.get("species", ""),
-                "top_level_category": row.get("top_level_category", ""),
-                "description": row.get("description", ""),
-                "alignment_score": round(alignment_score, 4),
-                "alignment_confidence": confidence,
-                "gene_overlap_count": overlap_count,
-                "gene_jaccard": round(gene_jaccard, 4),
-                "overlap_ratio_kegg": round(overlap_ratio_kegg, 4),
-                "name_similarity": round(name_similarity, 4),
-            }
-        )
-    ranked.sort(
-        key=lambda item: (
-            float(item["alignment_score"]),
-            int(item["gene_overlap_count"]),
-            item["species"] == "Arabidopsis thaliana",
-            item["pathway_name"],
-        ),
-        reverse=True,
+    from pathway_pipeline.step5_annotate_pathways import match_plant_reactome_context as _impl
+
+    return _impl(
+        pathway_name=pathway_name,
+        gene_ids=gene_ids,
+        brite_l1=brite_l1,
+        brite_l2=brite_l2,
+        brite_l3=brite_l3,
+        plant_reactome_pathways=plant_reactome_pathways,
+        plant_reactome_gene_sets=plant_reactome_gene_sets,
+        top_k=top_k,
     )
-    return ranked[:top_k]
 
 
 def build_annotation_confidence(
@@ -2278,21 +1534,18 @@ def build_annotation_confidence(
     plant_evidence_sources: tuple[str, ...],
     plant_reactome_alignment_confidence: str,
 ) -> str:
-    """Assign a simple confidence level to the final annotation bundle."""
+    """Compatibility wrapper for the step-5-owned annotation confidence rule."""
 
-    if brite_l1 and (
-        go_best_term
-        or aracyc_evidence_score > 0
-        or plant_reactome_alignment_confidence == "high"
-    ):
-        return "high"
-    if brite_l1 and (
-        reactome_matches
-        or plant_evidence_sources
-        or plant_reactome_alignment_confidence == "medium"
-    ):
-        return "medium"
-    return "low"
+    from pathway_pipeline.step5_annotate_pathways import build_annotation_confidence as _impl
+
+    return _impl(
+        brite_l1=brite_l1,
+        go_best_term=go_best_term,
+        aracyc_evidence_score=aracyc_evidence_score,
+        reactome_matches=reactome_matches,
+        plant_evidence_sources=plant_evidence_sources,
+        plant_reactome_alignment_confidence=plant_reactome_alignment_confidence,
+    )
 
 
 def gather_external_match_methods(
@@ -2305,51 +1558,11 @@ def gather_external_match_methods(
     lipidmaps_records: dict[str, LipidMapsRecord],
     lipidmaps_indexes: dict[str, defaultdict[str, set[str]]],
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """Collect how this compound touched external resources.
+    """Compatibility wrapper for the step-1-owned external-match summarizer."""
 
-    The return value is not a final mapping. It is only a provenance summary,
-    for example "matched PlantCyc by PubChem CID" or "matched LIPID MAPS by
-    InChIKey". Later scoring code uses these method labels as evidence tiers.
-    """
+    from pathway_pipeline.step1_alias_standardization import gather_external_match_methods as _impl
 
-    alias_exacts = {alias.exact for alias in base_aliases if alias.exact}
-    matched_plant: defaultdict[str, set[str]] = defaultdict(set)
-    matched_lipid: defaultdict[str, set[str]] = defaultdict(set)
-
-    if compound.chebi_accession in plantcyc_indexes["by_chebi"]:
-        for record_id in plantcyc_indexes["by_chebi"][compound.chebi_accession]:
-            matched_plant[record_id].add("chebi")
-    if compound.chebi_accession in lipidmaps_indexes["by_chebi"]:
-        for record_id in lipidmaps_indexes["by_chebi"][compound.chebi_accession]:
-            matched_lipid[record_id].add("chebi")
-
-    for cid in xrefs.pubchem_cids:
-        for record_id in plantcyc_indexes["by_pubchem"].get(cid, set()):
-            matched_plant[record_id].add("pubchem")
-        for record_id in lipidmaps_indexes["by_pubchem"].get(cid, set()):
-            matched_lipid[record_id].add("pubchem")
-
-    for kegg_id in xrefs.kegg_ids:
-        for record_id in plantcyc_indexes["by_kegg"].get(kegg_id, set()):
-            matched_plant[record_id].add("kegg")
-        for record_id in lipidmaps_indexes["by_kegg"].get(kegg_id, set()):
-            matched_lipid[record_id].add("kegg")
-
-    if structure and structure.standard_inchi_key:
-        for record_id in lipidmaps_indexes["by_inchi_key"].get(structure.standard_inchi_key, set()):
-            matched_lipid[record_id].add("inchi_key")
-
-    for alias_exact in alias_exacts:
-        plant_ids = plantcyc_indexes["by_name"].get(alias_exact)
-        if plant_ids and len(plant_ids) <= EXTERNAL_NAME_MATCH_MAX_RECORDS:
-            for record_id in plant_ids:
-                matched_plant[record_id].add("name")
-        lipid_ids = lipidmaps_indexes["by_name"].get(alias_exact)
-        if lipid_ids and len(lipid_ids) <= EXTERNAL_NAME_MATCH_MAX_RECORDS:
-            for record_id in lipid_ids:
-                matched_lipid[record_id].add("name")
-
-    return dict(matched_plant), dict(matched_lipid)
+    return _impl(compound, structure, xrefs, base_aliases, plantcyc_records, plantcyc_indexes, lipidmaps_records, lipidmaps_indexes)
 
 
 def build_compound_context(
@@ -2363,74 +1576,29 @@ def build_compound_context(
     lipidmaps_indexes: dict[str, defaultdict[str, set[str]]],
     pubchem_synonyms: dict[str, list[str]],
 ) -> CompoundContext:
-    """Merge all alias/support information available for one ChEBI compound."""
+    """Compatibility wrapper for the step-1-owned compound-context builder."""
 
-    matched_plantcyc_methods, matched_lipidmaps_methods = gather_external_match_methods(
-        compound=compound,
-        structure=structure,
-        xrefs=xrefs,
-        base_aliases=base_aliases,
-        plantcyc_records=plantcyc_records,
-        plantcyc_indexes=plantcyc_indexes,
-        lipidmaps_records=lipidmaps_records,
-        lipidmaps_indexes=lipidmaps_indexes,
-    )
+    from pathway_pipeline.step1_alias_standardization import build_compound_context as _impl
 
-    alias_bucket: dict[str, AliasRecord] = {}
-    for alias in base_aliases:
-        record_alias(alias_bucket, raw_name=alias.raw_name, source_type=alias.source_type, language_code=alias.language_code)
-
-    pubchem_cids = set(xrefs.pubchem_cids)
-    aracyc_pathways: defaultdict[str, set[str]] = defaultdict(set)
-    plantcyc_pathways: defaultdict[str, set[str]] = defaultdict(set)
-
-    for record_id in matched_plantcyc_methods:
-        record = plantcyc_records[record_id]
-        source_prefix = "aracyc" if record.source_db == "AraCyc" else "plantcyc"
-        # Once a PlantCyc/AraCyc record is plausibly connected to the current
-        # compound, its names become extra aliases and its pathways become
-        # downstream support signals.
-        record_alias(alias_bucket, raw_name=record.common_name, source_type=f"{source_prefix}_common_name")
-        for synonym in list(sorted(record.synonyms))[:MAX_EXTRA_SYNONYMS_PER_RECORD]:
-            record_alias(alias_bucket, raw_name=synonym, source_type=f"{source_prefix}_synonym")
-        pubchem_cids.update(record.pubchem_cids)
-        target = aracyc_pathways if record.source_db == "AraCyc" else plantcyc_pathways
-        for pathway_name in record.pathways:
-            normalized = normalize_name(pathway_name)
-            if normalized:
-                target[normalized].add(pathway_name)
-
-    for record_id in matched_lipidmaps_methods:
-        record = lipidmaps_records[record_id]
-        if record.common_name:
-            record_alias(alias_bucket, raw_name=record.common_name, source_type="lipidmaps_common_name")
-        if record.systematic_name:
-            record_alias(alias_bucket, raw_name=record.systematic_name, source_type="lipidmaps_systematic_name")
-        for synonym in list(sorted(record.synonyms))[:MAX_EXTRA_SYNONYMS_PER_RECORD]:
-            record_alias(alias_bucket, raw_name=synonym, source_type="lipidmaps_synonym")
-        pubchem_cids.update(record.pubchem_cids)
-
-    for cid in sorted(pubchem_cids):
-        # PubChem is used only as a synonym expansion source here. It is not
-        # treated as a canonical naming authority by itself.
-        for synonym in pubchem_synonyms.get(cid, [])[:MAX_PUBCHEM_SYNONYMS_PER_CID]:
-            record_alias(alias_bucket, raw_name=synonym, source_type="pubchem_synonym")
-
-    all_aliases = list(alias_bucket.values())
-    return CompoundContext(
-        all_aliases=all_aliases,
-        matched_plantcyc_methods=matched_plantcyc_methods,
-        matched_lipidmaps_methods=matched_lipidmaps_methods,
-        pubchem_cids=pubchem_cids,
-        aracyc_pathways=dict(aracyc_pathways),
-        plantcyc_pathways=dict(plantcyc_pathways),
+    return _impl(
+        compound,
+        structure,
+        xrefs,
+        base_aliases,
+        plantcyc_records,
+        plantcyc_indexes,
+        lipidmaps_records,
+        lipidmaps_indexes,
+        pubchem_synonyms,
     )
 
 
 def reason_summary(candidate: CandidateMapping) -> str:
-    """Collapse the most relevant evidence strings into a short explanation."""
+    """Compatibility wrapper for the step-2-owned explanation helper."""
 
-    return "; ".join(candidate.reasons[:4])
+    from pathway_pipeline.step2_map_names_to_kegg import reason_summary as _impl
+
+    return _impl(candidate)
 
 
 def lookup_token_edit_candidates(
@@ -2492,258 +1660,48 @@ def build_candidate_mappings(
     name_formula_index: dict[str, set[str]],
     kegg_structure_indexes: dict[str, dict[str, set[str]]],
 ) -> list[CandidateMapping]:
-    """Build and score all KEGG candidates for one ChEBI compound.
+    """Compatibility wrapper for the step-2-owned candidate builder."""
 
-    Matching order is intentional:
-    1. direct curated cross-references
-    2. exact InChIKey structure matches recovered from curated/external indexes
-    3. external structured support (PlantCyc, AraCyc, LIPID MAPS)
-    4. exact match to a KEGG standard name
-    5. exact match to a KEGG alias, then normalize back to the standard name
-    6. typo-correction fallback against KEGG standard names only, guarded by
-       molecular formula compatibility
-    """
+    from pathway_pipeline.step2_map_names_to_kegg import build_candidate_mappings as _impl
 
-    candidates: dict[str, CandidateMapping] = {}
-
-    def candidate_for(kegg_compound_id: str) -> CandidateMapping:
-        candidate = candidates.get(kegg_compound_id)
-        if candidate is None:
-            kegg = kegg_compounds[kegg_compound_id]
-            candidate = CandidateMapping(
-                kegg_compound_id=kegg_compound_id,
-                kegg_primary_name=kegg.primary_name,
-            )
-            candidates[kegg_compound_id] = candidate
-        return candidate
-
-    for kegg_id in sorted(xrefs.kegg_ids):
-        if kegg_id in kegg_compounds:
-            candidate_for(kegg_id).add_evidence(
-                score=0.995,
-                method="chebi_kegg_xref",
-                reason=f"Direct ChEBI KEGG cross-reference points to {kegg_id}",
-                direct_kegg_xref=True,
-                external_source="ChEBI",
-            )
-
-    if structure and structure.standard_inchi_key:
-        inchi_key = normalize_inchi_key(structure.standard_inchi_key)
-        for kegg_id, sources in sorted(kegg_structure_indexes.get("by_inchi_key_full", {}).get(inchi_key, {}).items()):
-            if kegg_id not in kegg_compounds:
-                continue
-            for source_label in sorted(sources):
-                source_score = 0.985 if source_label == "ChEBI" else 0.980
-                candidate_for(kegg_id).add_evidence(
-                    score=source_score,
-                    method="inchi_key_exact",
-                    reason=f"Exact InChIKey match links {compound.chebi_accession} to {kegg_id} via {source_label}",
-                    external_source=source_label,
-                    has_structure_evidence=True,
-                )
-
-    for bridge in plant_bridge_rows:
-        if bridge.kegg_cid not in kegg_compounds:
-            continue
-        candidate_for(bridge.kegg_cid).add_evidence(
-            score=bridge.bridge_score,
-            method=bridge.bridge_method,
-            reason=bridge.bridge_reason,
-            external_source=bridge.plant_db,
-            has_structure_evidence=bridge.has_structure_evidence,
-            plant_bridge_method=bridge.bridge_method,
-            plant_bridge_source=bridge.plant_db,
-            arabidopsis_supported=bridge.arabidopsis_supported,
-        )
-
-    for record_id, methods in context.matched_lipidmaps_methods.items():
-        record = lipidmaps_records[record_id]
-        if not record.kegg_ids:
-            continue
-        for kegg_id in record.kegg_ids:
-            if kegg_id not in kegg_compounds:
-                continue
-            score = 0.88
-            method_label = "name"
-            has_structure_evidence = False
-            if "inchi_key" in methods:
-                score = 0.97
-                method_label = "structure"
-                has_structure_evidence = True
-            elif "chebi" in methods or "kegg" in methods:
-                score = 0.96
-                method_label = "crossref"
-            elif "pubchem" in methods:
-                score = 0.94
-                method_label = "pubchem"
-            if structure and structure.formula_key and record.formula_key and structure.formula_key == record.formula_key:
-                score = min(score + 0.01, 0.98)
-            candidate_for(kegg_id).add_evidence(
-                score=score,
-                method=f"lipidmaps_{method_label}",
-                reason=f"LIPID MAPS links {compound.chebi_accession} to {kegg_id} via {','.join(sorted(methods))}",
-                external_source="LIPID MAPS",
-                has_structure_evidence=has_structure_evidence,
-            )
-
-    for alias in context.all_aliases:
-        matched_by_name = False
-        for variant_name in VARIANT_ORDER:
-            variant_value = getattr(alias, variant_name)
-            if not variant_value:
-                continue
-            standard_hit_ids = kegg_standard_indexes[variant_name].get(variant_value)
-            if standard_hit_ids:
-                # Preferred case: the incoming name already resolves directly to
-                # a KEGG canonical label.
-                matched_by_name = True
-                for kegg_id in standard_hit_ids:
-                    score = VARIANT_BASE_SCORES[variant_name] + ALIAS_SOURCE_WEIGHTS.get(alias.source_type, 0.0) + 0.03
-                    candidate_for(kegg_id).add_evidence(
-                        score=min(score, 0.98),
-                        method=f"name_match_{variant_name}",
-                        reason=f"{variant_name} standard-name match via {alias.source_type}: {alias.raw_name}",
-                        alias=alias.raw_name,
-                        source_type=alias.source_type,
-                        variant=variant_name,
-                        primary_name_match=True,
-                        used_pubchem_synonym=alias.source_type == "pubchem_synonym",
-                    )
-                break
-            alias_hit_ids = kegg_alias_indexes[variant_name].get(variant_value)
-            if not alias_hit_ids:
-                continue
-            # Second-best exact case: a KEGG synonym matches, so we keep the
-            # hit but explicitly describe the correction back to the standard
-            # KEGG primary name.
-            matched_by_name = True
-            for kegg_id in alias_hit_ids:
-                kegg = kegg_compounds[kegg_id]
-                score = VARIANT_BASE_SCORES[variant_name] + ALIAS_SOURCE_WEIGHTS.get(alias.source_type, 0.0)
-                candidate_for(kegg_id).add_evidence(
-                    score=min(score, 0.98),
-                    method=f"name_match_{variant_name}",
-                    reason=f"{variant_name} alias-table match via {alias.source_type}: {alias.raw_name}; corrected to standard name {kegg.primary_name}",
-                    alias=alias.raw_name,
-                    source_type=alias.source_type,
-                    variant=variant_name,
-                    primary_name_match=False,
-                    used_pubchem_synonym=alias.source_type == "pubchem_synonym",
-                )
-            break
-        if matched_by_name:
-            continue
-        compact_value = alias.compact
-        input_formula_keys = {structure.formula_key} if structure and structure.formula_key else set(name_formula_index.get(compact_value, set()))
-        hit_ids = lookup_compact_fuzzy_candidates(compact_value, kegg_primary_compact_delete_index)
-        if not hit_ids:
-            continue
-        for kegg_id in hit_ids:
-            kegg = kegg_compounds[kegg_id]
-            candidate_formula_keys = set(name_formula_index.get(kegg.primary_compact, set()))
-            # Final fallback: allow small spelling differences only when formula
-            # evidence does not contradict the correction target.
-            formula_validated = char_edit_distance_at_most_two(compact_value, kegg.primary_compact) and formula_sets_compatible(
-                input_formula_keys,
-                candidate_formula_keys,
-            )
-            formula_shared = bool(input_formula_keys and candidate_formula_keys and input_formula_keys & candidate_formula_keys)
-            if not formula_validated:
-                continue
-            score = CHAR_EDIT2_BASE_SCORE + ALIAS_SOURCE_WEIGHTS.get(alias.source_type, 0.0)
-            score += 0.02
-            if formula_shared:
-                score += 0.02
-            candidate_for(kegg_id).add_evidence(
-                score=min(score, 0.94),
-                method="name_match_compact_formula_edit2",
-                reason=f"compact edit<=2 with formula validation via {alias.source_type}: {alias.raw_name}; corrected to standard name {kegg.primary_name}",
-                alias=alias.raw_name,
-                source_type=alias.source_type,
-                variant="compact_formula_edit2",
-                primary_name_match=True,
-                used_pubchem_synonym=alias.source_type == "pubchem_synonym",
-            )
-
-    ranked = sorted(
-        candidates.values(),
-        key=lambda item: (
-            int(item.direct_kegg_xref),
-            int(item.has_structure_evidence),
-            item.best_score,
-            int(item.primary_name_match),
-            item.evidence_count,
-            item.kegg_compound_id,
-        ),
-        reverse=True,
+    return _impl(
+        compound=compound,
+        structure=structure,
+        xrefs=xrefs,
+        context=context,
+        plant_bridge_rows=plant_bridge_rows,
+        lipidmaps_records=lipidmaps_records,
+        kegg_compounds=kegg_compounds,
+        kegg_standard_indexes=kegg_standard_indexes,
+        kegg_alias_indexes=kegg_alias_indexes,
+        kegg_primary_compact_delete_index=kegg_primary_compact_delete_index,
+        name_formula_index=name_formula_index,
+        kegg_structure_indexes=kegg_structure_indexes,
     )
-    for candidate in ranked:
-        bonus = min(0.05, 0.01 * max(candidate.evidence_count - 1, 0))
-        if candidate.direct_kegg_xref:
-            bonus += 0.01
-        if candidate.has_structure_evidence:
-            bonus += 0.01
-        candidate.final_score = min(candidate.best_score + bonus, 0.999)
-    return ranked
 
 
 def select_candidates(ranked: list[CandidateMapping]) -> list[CandidateMapping]:
-    """Choose final mappings after evidence aggregation and ranking.
+    """Compatibility wrapper for the step-2-owned candidate selector."""
 
-    The function is intentionally conservative: weak or closely competing name
-    matches are kept out of the final mapping table and later marked as
-    ambiguous/unmapped by the caller.
-    """
+    from pathway_pipeline.step2_map_names_to_kegg import select_candidates as _impl
 
-    if not ranked:
-        return []
-    direct = [candidate for candidate in ranked if candidate.direct_kegg_xref]
-    if direct:
-        return direct
-    top = ranked[0]
-    if top.final_score < 0.88:
-        return []
-    if len(ranked) == 1:
-        return [top]
-    second = ranked[1]
-    if top.final_score >= 0.96:
-        return [top]
-    if top.final_score - second.final_score >= 0.03:
-        return [top]
-    return []
+    return _impl(ranked)
 
 
 def mapping_method_label(mapping: CandidateMapping) -> str:
-    """Convert internal evidence flags into a compact output label."""
+    """Compatibility wrapper for the step-2-owned method label helper."""
 
-    if mapping.direct_kegg_xref:
-        return "chebi_kegg_xref"
-    if "inchi_key_exact" in mapping.methods:
-        return "inchi_key_exact"
-    for method in (
-        "plant_direct_kegg_xref",
-        "plant_via_chebi",
-        "plant_inchikey_exact",
-        "plant_via_pubchem",
-        "plant_smiles_exact",
-    ):
-        if method in mapping.methods:
-            return method
-    if mapping.has_structure_evidence and "LIPID MAPS" in mapping.external_sources:
-        return "lipidmaps_structure_crossref"
-    if mapping.external_sources & {"AraCyc", "PlantCyc"}:
-        return "plantcyc_crossref"
-    return f"name_match_{mapping.best_variant or 'unknown'}"
+    from pathway_pipeline.step2_map_names_to_kegg import mapping_method_label as _impl
+
+    return _impl(mapping)
 
 
 def mapping_confidence_label(score: float) -> str:
-    """Bucket mapping scores into user-facing confidence bands."""
+    """Compatibility wrapper for the step-2-owned confidence label helper."""
 
-    if score >= 0.95:
-        return "high"
-    if score >= 0.88:
-        return "medium"
-    return "low"
+    from pathway_pipeline.step2_map_names_to_kegg import mapping_confidence_label as _impl
+
+    return _impl(score)
 
 
 def serialize_support_context(context: CompoundContext) -> StoredSupportContext:

@@ -18,30 +18,202 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+from collections import Counter, defaultdict
 import sys
 from pathlib import Path
+import zipfile
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from process_chebi_to_pathways_v2 import (
+    ALLOWED_CHEBI_ALIAS_TYPES,
+    EXTERNAL_NAME_MATCH_MAX_RECORDS,
+    KEGG_ID_RE,
+    MAX_EXTRA_SYNONYMS_PER_RECORD,
+    MAX_PUBCHEM_SYNONYMS_PER_CID,
+    PUBCHEM_CID_RE,
+    AliasRecord,
+    ChEBICompound,
+    CompoundContext,
+    LipidMapsRecord,
+    PlantCycCompound,
+    StructureInfo,
     XrefInfo,
-    build_compound_context,
-    build_name_formula_index,
     build_variants,
-    load_base_aliases,
-    load_comments_profile,
-    load_compounds,
-    load_formula_info,
-    load_lipidmaps_records,
-    load_plantcyc_compounds,
-    load_pubchem_synonyms,
-    load_structures,
-    load_xrefs,
+    formula_key,
+    keep_pubchem_synonym,
+    normalize_chebi_id,
+    normalize_name,
+    record_alias,
+    split_multi_value,
 )
 
 from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
 from pathway_pipeline.context import PipelineContext
+
+
+def load_compounds(path: Path) -> dict[str, ChEBICompound]:
+    """Load the local ChEBI compound table into memory."""
+
+    compounds: dict[str, ChEBICompound] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compounds[row["id"]] = ChEBICompound(
+                compound_id=row["id"],
+                chebi_accession=row["chebi_accession"],
+                name=row["name"],
+                ascii_name=row["ascii_name"],
+                definition=row["definition"],
+                stars=int(row["stars"] or 0),
+                status_id=row["status_id"],
+            )
+    return compounds
+
+
+def load_comments_profile(path: Path) -> dict[str, int]:
+    """Profile comments.tsv so the summary can explain why it is not used."""
+
+    counter: Counter[str] = Counter()
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            counter[row["datatype"] or "<empty>"] += 1
+    return dict(counter.most_common())
+
+
+def load_base_aliases(
+    compounds: dict[str, ChEBICompound],
+    names_path: Path,
+) -> dict[str, list[AliasRecord]]:
+    """Build the initial alias table from ChEBI primary names and names.tsv."""
+
+    aliases: dict[str, dict[str, AliasRecord]] = {compound_id: {} for compound_id in compounds}
+    for compound_id, compound in compounds.items():
+        record_alias(aliases[compound_id], raw_name=compound.name, source_type="compound_name", language_code="en")
+        if compound.ascii_name and compound.ascii_name != compound.name:
+            record_alias(aliases[compound_id], raw_name=compound.ascii_name, source_type="ascii_name", language_code="en")
+
+    with gzip.open(names_path, "rt", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = row["compound_id"]
+            if compound_id not in aliases:
+                continue
+            if row["type"] not in ALLOWED_CHEBI_ALIAS_TYPES:
+                continue
+            if row["language_code"] not in {"", "en"}:
+                continue
+            source_type = {
+                "SYNONYM": "chebi_synonym",
+                "IUPAC NAME": "chebi_iupac",
+                "INN": "chebi_inn",
+            }[row["type"]]
+            record_alias(aliases[compound_id], raw_name=row["name"], source_type=source_type, language_code=row["language_code"])
+            if row["ascii_name"] and row["ascii_name"] != row["name"]:
+                record_alias(aliases[compound_id], raw_name=row["ascii_name"], source_type=source_type, language_code=row["language_code"])
+
+    return {compound_id: list(alias_map.values()) for compound_id, alias_map in aliases.items()}
+
+
+def load_xrefs(path: Path) -> dict[str, XrefInfo]:
+    """Load curated external identifiers from ChEBI database_accession."""
+
+    xrefs: defaultdict[str, XrefInfo] = defaultdict(XrefInfo)
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = row["compound_id"]
+            accession = row["accession_number"].strip()
+            source_id = row["source_id"]
+            xref = xrefs[compound_id]
+            if source_id == "45" and KEGG_ID_RE.fullmatch(accession):
+                xref.kegg_ids.add(accession)
+            elif source_id == "68" and row["type"] == "MANUAL_X_REF" and PUBCHEM_CID_RE.fullmatch(accession):
+                xref.pubchem_cids.add(accession)
+            elif source_id == "35" and accession:
+                xref.hmdb_ids.add(accession if accession.upper().startswith("HMDB") else f"HMDB:{accession}")
+            elif source_id == "19" and accession:
+                xref.chemspider_ids.add(accession)
+    return dict(xrefs)
+
+
+def load_formula_info(path: Path) -> dict[str, tuple[str, str]]:
+    """Load preferred molecular formula/mass records for each ChEBI compound."""
+
+    formulas: dict[str, tuple[str, str]] = {}
+    preferred_status: dict[str, int] = {}
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = row["compound_id"]
+            status_rank = 0 if row["status_id"] == "1" else 1
+            if compound_id in formulas and status_rank >= preferred_status[compound_id]:
+                continue
+            formulas[compound_id] = (row["formula"] or "", row["monoisotopic_mass"] or "")
+            preferred_status[compound_id] = status_rank
+    return formulas
+
+
+def load_structures(path: Path, formulas: dict[str, tuple[str, str]]) -> dict[str, StructureInfo]:
+    """Load the preferred ChEBI structure row and attach formula metadata."""
+
+    structures: dict[str, StructureInfo] = {}
+    preferred_default: dict[str, int] = {}
+    with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = row["compound_id"]
+            is_default = 0 if row["default_structure"].lower() == "true" else 1
+            if compound_id in structures and is_default >= preferred_default[compound_id]:
+                continue
+            formula, monoisotopic_mass = formulas.get(compound_id, ("", ""))
+            structures[compound_id] = StructureInfo(
+                compound_id=compound_id,
+                smiles=row["smiles"] or "",
+                standard_inchi=row["standard_inchi"] or "",
+                standard_inchi_key=row["standard_inchi_key"] or "",
+                formula=formula,
+                formula_key=formula_key(formula),
+                monoisotopic_mass=monoisotopic_mass,
+            )
+            preferred_default[compound_id] = is_default
+    return structures
+
+
+def build_name_formula_index(
+    base_aliases: dict[str, list[AliasRecord]],
+    structures: dict[str, StructureInfo],
+    plantcyc_records: dict[str, PlantCycCompound],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+) -> dict[str, set[str]]:
+    """Create a compact-name -> formula-set lookup used by fuzzy validation."""
+
+    index: defaultdict[str, set[str]] = defaultdict(set)
+    for compound_id, aliases in base_aliases.items():
+        structure = structures.get(compound_id)
+        if not structure or not structure.formula_key:
+            continue
+        for alias in aliases:
+            if alias.compact:
+                index[alias.compact].add(structure.formula_key)
+    for record in plantcyc_records.values():
+        if not record.formula_key:
+            continue
+        for name in [record.common_name, *sorted(record.synonyms)]:
+            compact = build_variants(name)["compact"]
+            if compact:
+                index[compact].add(record.formula_key)
+    for record in lipidmaps_records.values():
+        if not record.formula_key:
+            continue
+        for name in [record.common_name, record.systematic_name, *sorted(record.synonyms)]:
+            compact = build_variants(name)["compact"]
+            if compact:
+                index[compact].add(record.formula_key)
+    return dict(index)
 
 
 def _inchi_key_prefix(value: str) -> str:
@@ -51,6 +223,341 @@ def _inchi_key_prefix(value: str) -> str:
     if not text:
         return ""
     return text.split("-", 1)[0]
+
+
+def parse_links_field(text: str) -> dict[str, set[str]]:
+    """Parse PMN/PlantCyc mixed link fields into typed identifier buckets."""
+
+    parsed = {
+        "chebi_ids": set(),
+        "pubchem_cids": set(),
+        "kegg_ids": set(),
+        "hmdb_ids": set(),
+    }
+    for item in split_multi_value(text):
+        if ":" not in item:
+            continue
+        prefix, value = item.split(":", 1)
+        prefix = prefix.strip().upper()
+        value = value.strip()
+        if not value:
+            continue
+        if prefix == "CHEBI":
+            parsed["chebi_ids"].add(normalize_chebi_id(value))
+        elif prefix == "PUBCHEM" and PUBCHEM_CID_RE.fullmatch(value):
+            parsed["pubchem_cids"].add(value)
+        elif prefix == "HMDB":
+            parsed["hmdb_ids"].add(value if value.upper().startswith("HMDB") else f"HMDB:{value}")
+        elif prefix in {"LIGAND-CPD", "KEGG", "CPD"} and KEGG_ID_RE.fullmatch(value):
+            parsed["kegg_ids"].add(value)
+    return parsed
+
+
+def load_plantcyc_compounds(
+    files: list[tuple[str, Path]],
+) -> tuple[
+    dict[str, PlantCycCompound],
+    dict[str, defaultdict[str, set[str]]],
+    set[str],
+]:
+    """Load AraCyc/PlantCyc compound exports and build cross-ID indexes."""
+
+    records: dict[str, PlantCycCompound] = {}
+    all_pubchem_cids: set[str] = set()
+    for source_db, path in files:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                record_id = f"{source_db}:{row['Compound_id']}"
+                record = records.get(record_id)
+                if record is None:
+                    record = PlantCycCompound(
+                        record_id=record_id,
+                        source_db=source_db,
+                        compound_id=row["Compound_id"],
+                        common_name=row["Compound_common_name"] or row["Compound_id"],
+                        formula=row["Chemical_formula"] or "",
+                        formula_key=formula_key(row["Chemical_formula"] or ""),
+                        smiles=row["Smiles"] or "",
+                    )
+                    records[record_id] = record
+                record.synonyms.update(split_multi_value(row["Compound_synonyms"]))
+                if row["Pathway"]:
+                    record.pathways.add(row["Pathway"])
+                parsed_links = parse_links_field(row["Links"] or "")
+                record.chebi_ids.update(parsed_links["chebi_ids"])
+                record.pubchem_cids.update(parsed_links["pubchem_cids"])
+                record.kegg_ids.update(parsed_links["kegg_ids"])
+                record.hmdb_ids.update(parsed_links["hmdb_ids"])
+                all_pubchem_cids.update(parsed_links["pubchem_cids"])
+
+    indexes = {
+        "by_chebi": defaultdict(set),
+        "by_pubchem": defaultdict(set),
+        "by_kegg": defaultdict(set),
+        "by_name": defaultdict(set),
+    }
+    for record_id, record in records.items():
+        for chebi_id in record.chebi_ids:
+            indexes["by_chebi"][chebi_id].add(record_id)
+        for cid in record.pubchem_cids:
+            indexes["by_pubchem"][cid].add(record_id)
+        for kegg_id in record.kegg_ids:
+            indexes["by_kegg"][kegg_id].add(record_id)
+        names = [record.common_name, *sorted(record.synonyms)]
+        for name in names:
+            normalized = normalize_name(name)
+            if normalized:
+                indexes["by_name"][normalized].add(record_id)
+    return records, indexes, all_pubchem_cids
+
+
+def parse_sdf_records_from_zip(path: Path):
+    """Stream SDF records from a zipped LMSD archive without full extraction."""
+
+    with zipfile.ZipFile(path) as archive:
+        member = archive.namelist()[0]
+        with archive.open(member) as handle:
+            fields: dict[str, str] = {}
+            current_field = None
+            current_lines: list[str] = []
+            for raw in handle:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if line == "$$$$":
+                    if current_field is not None:
+                        fields[current_field] = "\n".join(current_lines).strip()
+                    if fields:
+                        yield fields
+                    fields = {}
+                    current_field = None
+                    current_lines = []
+                    continue
+                if line.startswith("> <") and line.endswith(">"):
+                    if current_field is not None:
+                        fields[current_field] = "\n".join(current_lines).strip()
+                    current_field = line[3:-1]
+                    current_lines = []
+                    continue
+                if current_field is not None:
+                    if line == "":
+                        fields[current_field] = "\n".join(current_lines).strip()
+                        current_field = None
+                        current_lines = []
+                    else:
+                        current_lines.append(line)
+            if current_field is not None:
+                fields[current_field] = "\n".join(current_lines).strip()
+            if fields:
+                yield fields
+
+
+def load_lipidmaps_records(
+    path: Path,
+) -> tuple[
+    dict[str, LipidMapsRecord],
+    dict[str, defaultdict[str, set[str]]],
+    set[str],
+]:
+    """Load the subset of LIPID MAPS fields needed for matching/support."""
+
+    records: dict[str, LipidMapsRecord] = {}
+    all_pubchem_cids: set[str] = set()
+    for entry in parse_sdf_records_from_zip(path):
+        lm_id = entry.get("LM_ID", "").strip()
+        if not lm_id:
+            continue
+        record = LipidMapsRecord(
+            lm_id=lm_id,
+            common_name=entry.get("COMMON_NAME", "").strip(),
+            systematic_name=entry.get("SYSTEMATIC_NAME", "").strip(),
+            synonyms=set(split_multi_value(entry.get("SYNONYMS", ""))),
+            inchi_key=entry.get("INCHI_KEY", "").strip(),
+            smiles=entry.get("SMILES", "").strip(),
+            formula=entry.get("FORMULA", "").strip(),
+            formula_key=formula_key(entry.get("FORMULA", "")),
+            pubchem_cids={value for value in split_multi_value(entry.get("PUBCHEM_CID", "")) if PUBCHEM_CID_RE.fullmatch(value)},
+            kegg_ids={value for value in split_multi_value(entry.get("KEGG_ID", "")) if KEGG_ID_RE.fullmatch(value)},
+            hmdb_ids={value for value in split_multi_value(entry.get("HMDB_ID", "")) if value},
+            chebi_ids={normalize_chebi_id(value) for value in split_multi_value(entry.get("CHEBI_ID", "")) if normalize_chebi_id(value)},
+            category=entry.get("CATEGORY", "").strip(),
+            main_class=entry.get("MAIN_CLASS", "").strip(),
+            sub_class=entry.get("SUB_CLASS", "").strip(),
+        )
+        records[lm_id] = record
+        all_pubchem_cids.update(record.pubchem_cids)
+
+    indexes = {
+        "by_chebi": defaultdict(set),
+        "by_pubchem": defaultdict(set),
+        "by_kegg": defaultdict(set),
+        "by_inchi_key": defaultdict(set),
+        "by_name": defaultdict(set),
+    }
+    for lm_id, record in records.items():
+        for chebi_id in record.chebi_ids:
+            indexes["by_chebi"][chebi_id].add(lm_id)
+        for cid in record.pubchem_cids:
+            indexes["by_pubchem"][cid].add(lm_id)
+        for kegg_id in record.kegg_ids:
+            indexes["by_kegg"][kegg_id].add(lm_id)
+        if record.inchi_key:
+            indexes["by_inchi_key"][record.inchi_key].add(lm_id)
+        names = [record.common_name, record.systematic_name, *sorted(record.synonyms)]
+        for name in names:
+            normalized = normalize_name(name)
+            if normalized:
+                indexes["by_name"][normalized].add(lm_id)
+    return records, indexes, all_pubchem_cids
+
+
+def load_pubchem_synonyms(path: Path, target_cids: set[str]) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """Load only PubChem synonyms that are relevant to observed target CIDs."""
+
+    synonyms: defaultdict[str, list[str]] = defaultdict(list)
+    seen: defaultdict[str, set[str]] = defaultdict(set)
+    stats = {"target_cids": len(target_cids), "matched_lines": 0, "kept_synonyms": 0}
+    if not target_cids:
+        return {}, stats
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            cid, synonym = line.rstrip("\n").split("\t", 1)
+            if cid not in target_cids:
+                continue
+            stats["matched_lines"] += 1
+            synonym = synonym.strip()
+            if not keep_pubchem_synonym(synonym):
+                continue
+            normalized = normalize_name(synonym)
+            if not normalized or normalized in seen[cid]:
+                continue
+            if len(synonyms[cid]) >= MAX_PUBCHEM_SYNONYMS_PER_CID:
+                continue
+            synonyms[cid].append(synonym)
+            seen[cid].add(normalized)
+            stats["kept_synonyms"] += 1
+    return dict(synonyms), stats
+
+
+def gather_external_match_methods(
+    compound: ChEBICompound,
+    structure: StructureInfo | None,
+    xrefs: XrefInfo,
+    base_aliases: list[AliasRecord],
+    plantcyc_records: dict[str, PlantCycCompound],
+    plantcyc_indexes: dict[str, defaultdict[str, set[str]]],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+    lipidmaps_indexes: dict[str, defaultdict[str, set[str]]],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Collect how this compound touched external resources."""
+
+    alias_exacts = {alias.exact for alias in base_aliases if alias.exact}
+    matched_plant: defaultdict[str, set[str]] = defaultdict(set)
+    matched_lipid: defaultdict[str, set[str]] = defaultdict(set)
+
+    if compound.chebi_accession in plantcyc_indexes["by_chebi"]:
+        for record_id in plantcyc_indexes["by_chebi"][compound.chebi_accession]:
+            matched_plant[record_id].add("chebi")
+    if compound.chebi_accession in lipidmaps_indexes["by_chebi"]:
+        for record_id in lipidmaps_indexes["by_chebi"][compound.chebi_accession]:
+            matched_lipid[record_id].add("chebi")
+
+    for cid in xrefs.pubchem_cids:
+        for record_id in plantcyc_indexes["by_pubchem"].get(cid, set()):
+            matched_plant[record_id].add("pubchem")
+        for record_id in lipidmaps_indexes["by_pubchem"].get(cid, set()):
+            matched_lipid[record_id].add("pubchem")
+
+    for kegg_id in xrefs.kegg_ids:
+        for record_id in plantcyc_indexes["by_kegg"].get(kegg_id, set()):
+            matched_plant[record_id].add("kegg")
+        for record_id in lipidmaps_indexes["by_kegg"].get(kegg_id, set()):
+            matched_lipid[record_id].add("kegg")
+
+    if structure and structure.standard_inchi_key:
+        for record_id in lipidmaps_indexes["by_inchi_key"].get(structure.standard_inchi_key, set()):
+            matched_lipid[record_id].add("inchi_key")
+
+    for alias_exact in alias_exacts:
+        plant_ids = plantcyc_indexes["by_name"].get(alias_exact)
+        if plant_ids and len(plant_ids) <= EXTERNAL_NAME_MATCH_MAX_RECORDS:
+            for record_id in plant_ids:
+                matched_plant[record_id].add("name")
+        lipid_ids = lipidmaps_indexes["by_name"].get(alias_exact)
+        if lipid_ids and len(lipid_ids) <= EXTERNAL_NAME_MATCH_MAX_RECORDS:
+            for record_id in lipid_ids:
+                matched_lipid[record_id].add("name")
+
+    return dict(matched_plant), dict(matched_lipid)
+
+
+def build_compound_context(
+    compound: ChEBICompound,
+    structure: StructureInfo | None,
+    xrefs: XrefInfo,
+    base_aliases: list[AliasRecord],
+    plantcyc_records: dict[str, PlantCycCompound],
+    plantcyc_indexes: dict[str, defaultdict[str, set[str]]],
+    lipidmaps_records: dict[str, LipidMapsRecord],
+    lipidmaps_indexes: dict[str, defaultdict[str, set[str]]],
+    pubchem_synonyms: dict[str, list[str]],
+) -> CompoundContext:
+    """Merge all alias/support information available for one ChEBI compound."""
+
+    matched_plantcyc_methods, matched_lipidmaps_methods = gather_external_match_methods(
+        compound=compound,
+        structure=structure,
+        xrefs=xrefs,
+        base_aliases=base_aliases,
+        plantcyc_records=plantcyc_records,
+        plantcyc_indexes=plantcyc_indexes,
+        lipidmaps_records=lipidmaps_records,
+        lipidmaps_indexes=lipidmaps_indexes,
+    )
+
+    alias_bucket: dict[str, AliasRecord] = {}
+    for alias in base_aliases:
+        record_alias(alias_bucket, raw_name=alias.raw_name, source_type=alias.source_type, language_code=alias.language_code)
+
+    pubchem_cids = set(xrefs.pubchem_cids)
+    aracyc_pathways: defaultdict[str, set[str]] = defaultdict(set)
+    plantcyc_pathways: defaultdict[str, set[str]] = defaultdict(set)
+
+    for record_id in matched_plantcyc_methods:
+        record = plantcyc_records[record_id]
+        source_prefix = "aracyc" if record.source_db == "AraCyc" else "plantcyc"
+        record_alias(alias_bucket, raw_name=record.common_name, source_type=f"{source_prefix}_common_name")
+        for synonym in list(sorted(record.synonyms))[:MAX_EXTRA_SYNONYMS_PER_RECORD]:
+            record_alias(alias_bucket, raw_name=synonym, source_type=f"{source_prefix}_synonym")
+        pubchem_cids.update(record.pubchem_cids)
+        target = aracyc_pathways if record.source_db == "AraCyc" else plantcyc_pathways
+        for pathway_name in record.pathways:
+            normalized = normalize_name(pathway_name)
+            if normalized:
+                target[normalized].add(pathway_name)
+
+    for record_id in matched_lipidmaps_methods:
+        record = lipidmaps_records[record_id]
+        if record.common_name:
+            record_alias(alias_bucket, raw_name=record.common_name, source_type="lipidmaps_common_name")
+        if record.systematic_name:
+            record_alias(alias_bucket, raw_name=record.systematic_name, source_type="lipidmaps_systematic_name")
+        for synonym in list(sorted(record.synonyms))[:MAX_EXTRA_SYNONYMS_PER_RECORD]:
+            record_alias(alias_bucket, raw_name=synonym, source_type="lipidmaps_synonym")
+        pubchem_cids.update(record.pubchem_cids)
+
+    for cid in sorted(pubchem_cids):
+        for synonym in pubchem_synonyms.get(cid, [])[:MAX_PUBCHEM_SYNONYMS_PER_CID]:
+            record_alias(alias_bucket, raw_name=synonym, source_type="pubchem_synonym")
+
+    all_aliases = list(alias_bucket.values())
+    return CompoundContext(
+        all_aliases=all_aliases,
+        matched_plantcyc_methods=matched_plantcyc_methods,
+        matched_lipidmaps_methods=matched_lipidmaps_methods,
+        pubchem_cids=pubchem_cids,
+        aracyc_pathways=dict(aracyc_pathways),
+        plantcyc_pathways=dict(plantcyc_pathways),
+    )
 
 
 def write_name_normalization_index(context: PipelineContext) -> int:

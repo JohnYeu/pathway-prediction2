@@ -17,13 +17,25 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from process_chebi_to_pathways_v2 import load_ath_pathways
-
 from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
 from pathway_pipeline.context import PipelineContext, Step4ResolvedPathwayHit
 from pathway_pipeline.step1_alias_standardization import run as run_step1
 from pathway_pipeline.step2_map_names_to_kegg import run as run_step2
 from pathway_pipeline.step3_link_compounds_to_pathways import run as run_step3
+
+
+def load_ath_pathways(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Load ath pathway names and a mapXXXX -> athXXXX conversion table."""
+
+    ath_pathways: dict[str, str] = {}
+    map_to_ath: dict[str, str] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            pathway_id, raw_name = line.rstrip("\n").split("\t", 1)
+            pathway_name = raw_name.split(" - ", 1)[0]
+            ath_pathways[pathway_id] = pathway_name
+            map_to_ath[f"map{pathway_id[3:]}"] = pathway_id
+    return ath_pathways, map_to_ath
 
 
 def write_map_to_ath_index(context: PipelineContext) -> int:

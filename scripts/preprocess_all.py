@@ -28,6 +28,7 @@ from pathway_pipeline import (
     step5_annotate_pathways,
     step6_score_pathways,
     step7_output_results,
+    step8_expanded_recall,
 )
 
 
@@ -63,6 +64,7 @@ def main() -> None:
     step5_annotate_pathways.run(context)
     print("Scoring and writing outputs...", flush=True)
     step6_score_pathways.run(context)
+    step8_expanded_recall.run(context)
     step7_output_results.run(context)
 
     print("Preprocess completed.", flush=True)
