@@ -284,6 +284,15 @@ class AraCycPathwayInfo:
 
 
 @dataclass(slots=True)
+class Step1AraCycResolution:
+    """Exact AraCyc bridge decided during step 1 for one ChEBI compound."""
+
+    record_id: str
+    aracyc_compound_id: str
+    resolved_by: str
+
+
+@dataclass(slots=True)
 class PipelinePaths:
     """All well-known input and output paths used by the refactored pipeline."""
 
@@ -321,6 +330,8 @@ class PipelinePaths:
     plant_reactome_gene_pathway_path: Path
     plant_reactome_version_path: Path
     preprocessed_dir: Path
+    step1_result_path: Path
+    step1_alias_unified_path: Path
     alias_output_path: Path
     mapping_summary_path: Path
     mapping_selected_path: Path
@@ -410,6 +421,8 @@ class PipelinePaths:
             plant_reactome_gene_pathway_path=refs / "plant_reactome_gene_pathway.tsv",
             plant_reactome_version_path=refs / "plant_reactome_version.txt",
             preprocessed_dir=preprocessed_dir,
+            step1_result_path=preprocessed_dir / "step1_result.tsv",
+            step1_alias_unified_path=preprocessed_dir / "step1_alias_unified.tsv",
             alias_output_path=outputs / f"chebi_aliases_standardized{suffix}.tsv",
             mapping_summary_path=outputs / f"chebi_kegg_mapping{suffix}.tsv",
             mapping_selected_path=outputs / f"chebi_kegg_selected{suffix}.tsv",
@@ -561,6 +574,7 @@ class PipelineContext:
     # AraCyc-first pipeline state
     aracyc_pathway_info: dict[str, AraCycPathwayInfo] = field(default_factory=dict)
     aracyc_pathway_compound_counts: dict[str, int] = field(default_factory=dict)
+    step1_aracyc_resolutions: dict[str, Step1AraCycResolution] = field(default_factory=dict)
     aracyc_matches_by_compound: dict[str, list[AraCycCompoundMatch]] = field(default_factory=dict)
     aracyc_pathway_hits: dict[str, list[AraCycPathwayHit]] = field(default_factory=dict)
     annotated_aracyc_hits: dict[str, list[AnnotatedAraCycHit]] = field(default_factory=dict)

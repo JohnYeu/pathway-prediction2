@@ -1,12 +1,12 @@
 """Step 2 (AraCyc-first): map ChEBI compounds to AraCyc/PlantCyc compounds.
 
-Matching hierarchy (highest priority first):
-  1. Direct ChEBI xref in AraCyc Links field  (score 1.00)
-  2. KEGG xref bridge via AraCyc LIGAND-CPD    (score 0.95)
-  3. InChIKey exact match from SMILES           (score 0.90)
-  3b. Tanimoto similarity >= 0.85               (score 0.85)
-  4. Name matching (exact/compact/singular)      (score 0.70-0.80)
-  5. PlantCyc fallback (same tiers, lower base)  (score * 0.85)
+This step consumes the step-1 entity table plus the step-1 alias-variant table.
+Exact AraCyc bridges already resolved in step 1 are reused directly. Only the
+remaining unresolved ChEBI rows continue through the fallback hierarchy:
+
+  1. Tanimoto similarity >= 0.85 (same formula_key only)
+  2. Name matching (exact/compact/singular/stereo_stripped)
+  3. PlantCyc fallback (same tiers, lower base)
 """
 
 from __future__ import annotations
@@ -42,6 +42,60 @@ COFACTOR_NAME_TOKENS = {
     "oxygen", "coenzyme a", "phosphate", "pyrophosphate", "carbon dioxide",
     "proton", "h+", "h2o", "o2", "co2",
 }
+
+VARIANT_TYPES = ("exact", "compact", "singular", "stereo_stripped")
+
+
+def load_step1_result(path: Path) -> dict[str, dict[str, str]]:
+    """Load the step-1 entity table for chebi-backed rows only."""
+
+    rows: dict[str, dict[str, str]] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = (row.get("compound_id") or "").strip()
+            if not compound_id:
+                continue
+            if row.get("entity_source") != "chebi":
+                continue
+            rows[compound_id] = {
+                "compound_id": compound_id,
+                "chebi_accession": row.get("chebi_accession", ""),
+                "aracyc_compound_id": row.get("aracyc_compound_id", ""),
+                "entity_source": row.get("entity_source", ""),
+                "ara_tag": row.get("ara_tag", ""),
+                "resolved_by": row.get("resolved_by", ""),
+                "display_name": row.get("display_name", ""),
+            }
+    return rows
+
+
+def load_step1_alias_unified(path: Path) -> dict[str, dict[str, set[str]]]:
+    """Load and pre-aggregate step-1 alias variants for each ChEBI compound."""
+
+    aggregated: defaultdict[str, dict[str, set[str]]] = defaultdict(
+        lambda: {variant: set() for variant in VARIANT_TYPES}
+    )
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            compound_id = (row.get("compound_id") or "").strip()
+            if not compound_id:
+                continue
+            if row.get("entity_source") != "chebi":
+                continue
+            aggregated[compound_id]["exact"].add((row.get("normalized_name") or "").strip())
+            aggregated[compound_id]["compact"].add((row.get("compact_name") or "").strip())
+            aggregated[compound_id]["singular"].add((row.get("singular_name") or "").strip())
+            aggregated[compound_id]["stereo_stripped"].add((row.get("stereo_stripped_name") or "").strip())
+
+    return {
+        compound_id: {
+            variant: {value for value in values if value}
+            for variant, values in variant_sets.items()
+        }
+        for compound_id, variant_sets in aggregated.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +180,17 @@ def _build_morgan_fp_index(
     return fps
 
 
+def _build_formula_key_index(
+    records: dict[str, PlantCycCompound],
+) -> dict[str, set[str]]:
+    """Map formula_key -> set of record_ids to keep Tanimoto candidate sets small."""
+    idx: dict[str, set[str]] = defaultdict(set)
+    for record_id, rec in records.items():
+        if rec.formula_key:
+            idx[rec.formula_key].add(record_id)
+    return dict(idx)
+
+
 def _build_name_index(
     records: dict[str, PlantCycCompound],
 ) -> dict[str, dict[str, set[str]]]:
@@ -192,6 +257,25 @@ def _build_match(
     )
 
 
+def _exact_bridge_score(method: str) -> float:
+    """Return the fixed score for an exact step-1 AraCyc bridge."""
+
+    return {
+        "inchikey": 1.00,
+        "chebi_xref": 0.98,
+        "kegg_xref": 0.95,
+    }[method]
+
+
+def _match_sort_key(match: AraCycCompoundMatch) -> tuple[float, int, int, int, str]:
+    """Sort matches deterministically, preferring Arabidopsis structure evidence."""
+
+    source_rank = 0 if match.source_db == "AraCyc" else 1
+    structure_rank = 0 if match.structure_validated else 1
+    chebi_rank = 0 if match.chebi_xref_direct else 1
+    return (-match.match_score, source_rank, structure_rank, chebi_rank, match.aracyc_compound_id)
+
+
 def _chebi_inchikey(compound_id: str, structures: dict[str, StructureInfo]) -> str:
     """Get InChIKey for a ChEBI compound from preloaded structures."""
     si = structures.get(compound_id)
@@ -222,9 +306,43 @@ def _tanimoto(fp1, fp2) -> float:
     return DataStructs.TanimotoSimilarity(fp1, fp2)
 
 
+def _best_tanimoto_match(
+    compound_id: str,
+    structures: dict[str, StructureInfo],
+    fp_idx: dict[str, object],
+    formula_idx: dict[str, set[str]],
+    seen_record_ids: set[str],
+) -> tuple[str | None, float]:
+    """Find the best same-formula fingerprint neighbor at Tanimoto >= 0.85."""
+    structure = structures.get(compound_id)
+    if structure is None or not structure.formula_key:
+        return None, 0.0
+    candidate_ids = formula_idx.get(structure.formula_key, set())
+    if not candidate_ids:
+        return None, 0.0
+    chebi_fp = _chebi_morgan_fp(compound_id, structures)
+    if chebi_fp is None:
+        return None, 0.0
+
+    best_sim = 0.0
+    best_record_id: str | None = None
+    for record_id in candidate_ids:
+        if record_id in seen_record_ids:
+            continue
+        target_fp = fp_idx.get(record_id)
+        if target_fp is None:
+            continue
+        sim = _tanimoto(chebi_fp, target_fp)
+        if sim >= 0.85 and sim > best_sim:
+            best_sim = sim
+            best_record_id = record_id
+    return best_record_id, best_sim
+
+
 def _match_one_compound(
     compound_id: str,
     compound: ChEBICompound,
+    compound_variant_sets: dict[str, set[str]] | None,
     xrefs: dict[str, XrefInfo],
     structures: dict[str, StructureInfo],
     aracyc_records: dict[str, PlantCycCompound],
@@ -233,12 +351,16 @@ def _match_one_compound(
     aracyc_kegg_idx: dict[str, set[str]],
     aracyc_inchikey_idx: dict[str, set[str]],
     aracyc_fp_idx: dict[str, object],
+    aracyc_formula_idx: dict[str, set[str]],
     aracyc_name_idx: dict[str, dict[str, set[str]]],
     plantcyc_chebi_idx: dict[str, set[str]],
     plantcyc_kegg_idx: dict[str, set[str]],
     plantcyc_inchikey_idx: dict[str, set[str]],
     plantcyc_fp_idx: dict[str, object],
+    plantcyc_formula_idx: dict[str, set[str]],
     plantcyc_name_idx: dict[str, dict[str, set[str]]],
+    *,
+    skip_exact_aracyc: bool = False,
 ) -> list[AraCycCompoundMatch]:
     """Try to match one ChEBI compound to AraCyc/PlantCyc records.
 
@@ -249,89 +371,100 @@ def _match_one_compound(
     seen_record_ids: set[str] = set()
     chebi_accession = f"CHEBI:{compound_id}"
 
-    # --- Tier 1: Direct ChEBI xref (AraCyc) ---
-    for record_id in aracyc_chebi_idx.get(chebi_accession, set()) | aracyc_chebi_idx.get(compound_id, set()):
-        if record_id in seen_record_ids:
-            continue
-        seen_record_ids.add(record_id)
-        record = aracyc_records[record_id]
-        matches.append(_build_match(record, method="chebi_xref", score=1.00, chebi_xref_direct=True, structure_validated=False))
-
-    # --- Tier 2: KEGG xref bridge (AraCyc) ---
-    xref_info = xrefs.get(compound_id)
-    if xref_info and xref_info.kegg_ids:
-        for kegg_id in xref_info.kegg_ids:
-            for record_id in aracyc_kegg_idx.get(kegg_id, set()):
-                if record_id in seen_record_ids:
-                    continue
-                seen_record_ids.add(record_id)
-                record = aracyc_records[record_id]
-                matches.append(_build_match(record, method="kegg_xref", score=0.95, chebi_xref_direct=False, structure_validated=False))
-
-    # --- Tier 3: InChIKey exact match (AraCyc) ---
-    chebi_ik = _chebi_inchikey(compound_id, structures)
-    if chebi_ik:
-        for record_id in aracyc_inchikey_idx.get(chebi_ik, set()):
+    if not skip_exact_aracyc:
+        # --- Tier 1: Direct ChEBI xref (AraCyc) ---
+        for record_id in aracyc_chebi_idx.get(chebi_accession, set()) | aracyc_chebi_idx.get(compound_id, set()):
             if record_id in seen_record_ids:
                 continue
             seen_record_ids.add(record_id)
             record = aracyc_records[record_id]
-            matches.append(_build_match(record, method="inchikey", score=0.90, chebi_xref_direct=False, structure_validated=True))
+            matches.append(_build_match(record, method="chebi_xref", score=0.98, chebi_xref_direct=True, structure_validated=False))
 
-    # --- Tier 3b: Tanimoto similarity >= 0.85 (AraCyc) ---
-    # Disabled by default: O(N*M) brute-force is too slow for 200K compounds.
-    # Uncomment or pass enable_tanimoto=True when a faster index is available.
-    # if not matches and aracyc_fp_idx:
-    #     chebi_fp = _chebi_morgan_fp(compound_id, structures)
-    #     if chebi_fp is not None:
-    #         best_sim, best_record_id = 0.0, None
-    #         for record_id, aracyc_fp in aracyc_fp_idx.items():
-    #             if record_id in seen_record_ids: continue
-    #             sim = _tanimoto(chebi_fp, aracyc_fp)
-    #             if sim >= 0.85 and sim > best_sim:
-    #                 best_sim, best_record_id = sim, record_id
-    #         if best_record_id is not None:
-    #             seen_record_ids.add(best_record_id)
-    #             record = aracyc_records[best_record_id]
-    #             matches.append(_make_match(record, "tanimoto", round(0.85 * best_sim, 4), False, True))
+        # --- Tier 2: KEGG xref bridge (AraCyc) ---
+        xref_info = xrefs.get(compound_id)
+        if xref_info and xref_info.kegg_ids:
+            for kegg_id in xref_info.kegg_ids:
+                for record_id in aracyc_kegg_idx.get(kegg_id, set()):
+                    if record_id in seen_record_ids:
+                        continue
+                    seen_record_ids.add(record_id)
+                    record = aracyc_records[record_id]
+                    matches.append(_build_match(record, method="kegg_xref", score=0.95, chebi_xref_direct=False, structure_validated=False))
 
-    # --- Tier 4: Name matching (AraCyc) ---
-    if not matches:
-        all_names = [compound.name]
-        compound_variants = {}
-        for name in all_names:
-            compound_variants.update(build_variants(name))
-
-        name_match_scores = {"exact": 0.80, "compact": 0.76, "singular": 0.73, "stereo_stripped": 0.70}
-        for vtype in ("exact", "compact", "singular", "stereo_stripped"):
-            vtext = compound_variants.get(vtype, "")
-            if not vtext:
-                continue
-            for record_id in aracyc_name_idx.get(vtype, {}).get(vtext, set()):
+        # --- Tier 3: InChIKey exact match (AraCyc) ---
+        chebi_ik = _chebi_inchikey(compound_id, structures)
+        if chebi_ik:
+            for record_id in aracyc_inchikey_idx.get(chebi_ik, set()):
                 if record_id in seen_record_ids:
                     continue
                 seen_record_ids.add(record_id)
                 record = aracyc_records[record_id]
-                matches.append(_build_match(record, method=f"name_{vtype}", score=name_match_scores[vtype], chebi_xref_direct=False, structure_validated=False))
+                matches.append(_build_match(record, method="inchikey", score=1.00, chebi_xref_direct=False, structure_validated=True))
+
+    # --- Tier 3b: Tanimoto similarity >= 0.85 (AraCyc) ---
+    if not matches and aracyc_fp_idx:
+        best_record_id, best_sim = _best_tanimoto_match(
+            compound_id, structures, aracyc_fp_idx, aracyc_formula_idx, seen_record_ids
+        )
+        if best_record_id is not None:
+            seen_record_ids.add(best_record_id)
+            record = aracyc_records[best_record_id]
+            matches.append(
+                _build_match(
+                    record,
+                    method="tanimoto",
+                    score=round(0.85 * best_sim, 4),
+                    chebi_xref_direct=False,
+                    structure_validated=True,
+                )
+            )
+
+    # --- Tier 4: Name matching (AraCyc) ---
+    if not matches:
+        name_match_scores = {"exact": 0.80, "compact": 0.76, "singular": 0.73, "stereo_stripped": 0.70}
+        if compound_variant_sets is None:
+            raw_variants = build_variants(compound.name)
+            compound_variant_sets = {
+                vtype: {raw_variants[vtype]} if raw_variants.get(vtype) else set()
+                for vtype in VARIANT_TYPES
+            }
+        for vtype in VARIANT_TYPES:
+            for vtext in sorted(compound_variant_sets.get(vtype, set())):
+                if not vtext:
+                    continue
+                for record_id in aracyc_name_idx.get(vtype, {}).get(vtext, set()):
+                    if record_id in seen_record_ids:
+                        continue
+                    seen_record_ids.add(record_id)
+                    record = aracyc_records[record_id]
+                    matches.append(
+                        _build_match(
+                            record,
+                            method=f"name_{vtype}",
+                            score=name_match_scores[vtype],
+                            chebi_xref_direct=False,
+                            structure_validated=False,
+                        )
+                    )
 
     # --- Tier 5: PlantCyc fallback (same tiers, discounted by 0.85) ---
     if not matches:
         plantcyc_matches = _match_plantcyc_fallback(
-            compound_id, compound, xrefs, structures,
+            compound_id, compound, compound_variant_sets, xrefs, structures,
             plantcyc_records, plantcyc_chebi_idx, plantcyc_kegg_idx,
-            plantcyc_inchikey_idx, plantcyc_fp_idx, plantcyc_name_idx,
+            plantcyc_inchikey_idx, plantcyc_fp_idx, plantcyc_formula_idx, plantcyc_name_idx,
             seen_record_ids,
         )
         matches.extend(plantcyc_matches)
 
-    # Sort by score descending
-    matches.sort(key=lambda m: m.match_score, reverse=True)
+    matches.sort(key=_match_sort_key)
     return matches
 
 
 def _match_plantcyc_fallback(
     compound_id: str,
     compound: ChEBICompound,
+    compound_variant_sets: dict[str, set[str]] | None,
     xrefs: dict[str, XrefInfo],
     structures: dict[str, StructureInfo],
     plantcyc_records: dict[str, PlantCycCompound],
@@ -339,6 +472,7 @@ def _match_plantcyc_fallback(
     plantcyc_kegg_idx: dict[str, set[str]],
     plantcyc_inchikey_idx: dict[str, set[str]],
     plantcyc_fp_idx: dict[str, object],
+    plantcyc_formula_idx: dict[str, set[str]],
     plantcyc_name_idx: dict[str, dict[str, set[str]]],
     seen_record_ids: set[str],
 ) -> list[AraCycCompoundMatch]:
@@ -375,21 +509,51 @@ def _match_plantcyc_fallback(
             seen_record_ids.add(record_id)
             matches.append(_build_match(plantcyc_records[record_id], method="inchikey", score=0.90, chebi_xref_direct=False, structure_validated=True, discount=DISCOUNT))
 
-    # Tanimoto — disabled (see AraCyc tier 3b comment above)
+    # Tanimoto similarity >= 0.85
+    if not matches and plantcyc_fp_idx:
+        best_record_id, best_sim = _best_tanimoto_match(
+            compound_id, structures, plantcyc_fp_idx, plantcyc_formula_idx, seen_record_ids
+        )
+        if best_record_id is not None:
+            seen_record_ids.add(best_record_id)
+            matches.append(
+                _build_match(
+                    plantcyc_records[best_record_id],
+                    method="tanimoto",
+                    score=round(0.85 * best_sim, 4),
+                    chebi_xref_direct=False,
+                    structure_validated=True,
+                    discount=DISCOUNT,
+                )
+            )
 
     # Name matching
     if not matches:
-        compound_variants = build_variants(compound.name)
         name_scores = {"exact": 0.80, "compact": 0.76, "singular": 0.73, "stereo_stripped": 0.70}
-        for vtype in ("exact", "compact", "singular", "stereo_stripped"):
-            vtext = compound_variants.get(vtype, "")
-            if not vtext:
-                continue
-            for record_id in plantcyc_name_idx.get(vtype, {}).get(vtext, set()):
-                if record_id in seen_record_ids:
+        if compound_variant_sets is None:
+            raw_variants = build_variants(compound.name)
+            compound_variant_sets = {
+                vtype: {raw_variants[vtype]} if raw_variants.get(vtype) else set()
+                for vtype in VARIANT_TYPES
+            }
+        for vtype in VARIANT_TYPES:
+            for vtext in sorted(compound_variant_sets.get(vtype, set())):
+                if not vtext:
                     continue
-                seen_record_ids.add(record_id)
-                matches.append(_build_match(plantcyc_records[record_id], method=f"name_{vtype}", score=name_scores[vtype], chebi_xref_direct=False, structure_validated=False, discount=DISCOUNT))
+                for record_id in plantcyc_name_idx.get(vtype, {}).get(vtext, set()):
+                    if record_id in seen_record_ids:
+                        continue
+                    seen_record_ids.add(record_id)
+                    matches.append(
+                        _build_match(
+                            plantcyc_records[record_id],
+                            method=f"name_{vtype}",
+                            score=name_scores[vtype],
+                            chebi_xref_direct=False,
+                            structure_validated=False,
+                            discount=DISCOUNT,
+                        )
+                    )
 
     return matches
 
@@ -500,6 +664,9 @@ def run(context: PipelineContext) -> PipelineContext:
     # Separate AraCyc and PlantCyc records (already loaded in step1)
     aracyc_records = _filter_aracyc_records(context.plantcyc_records)
     plantcyc_records = _filter_plantcyc_records(context.plantcyc_records)
+    step1_rows = load_step1_result(context.paths.step1_result_path)
+    step1_alias_variants = load_step1_alias_unified(context.paths.step1_alias_unified_path)
+    aracyc_record_by_compound_id = {record.compound_id: record for record in aracyc_records.values()}
     context.aracyc_reference_compound_keys = {
         _reference_compound_key(record) for record in aracyc_records.values()
     }
@@ -518,6 +685,7 @@ def run(context: PipelineContext) -> PipelineContext:
     print("    Building InChIKey and fingerprint indexes...", flush=True)
     aracyc_inchikey_idx = _build_inchikey_index(aracyc_records)
     aracyc_fp_idx = _build_morgan_fp_index(aracyc_records)
+    aracyc_formula_idx = _build_formula_key_index(aracyc_records)
 
     # Build PlantCyc indexes
     plantcyc_chebi_idx = _build_chebi_xref_index(plantcyc_records)
@@ -525,25 +693,52 @@ def run(context: PipelineContext) -> PipelineContext:
     plantcyc_name_idx = _build_name_index(plantcyc_records)
     plantcyc_inchikey_idx = _build_inchikey_index(plantcyc_records)
     plantcyc_fp_idx = _build_morgan_fp_index(plantcyc_records)
+    plantcyc_formula_idx = _build_formula_key_index(plantcyc_records)
 
     print(f"    AraCyc InChIKey index: {len(aracyc_inchikey_idx)} entries", flush=True)
     print(f"    AraCyc FP index: {len(aracyc_fp_idx)} entries", flush=True)
 
     # Match all compounds
     print("  Step 2a: Matching all compounds against AraCyc/PlantCyc...", flush=True)
+    context.aracyc_matches_by_compound.clear()
     match_count = 0
     method_counts: dict[str, int] = defaultdict(int)
 
-    for compound_id in sorted(context.compounds, key=int):
-        compound = context.compounds[compound_id]
+    for compound_id in sorted(step1_rows, key=int):
+        compound = context.compounds.get(compound_id)
+        if compound is None:
+            context.aracyc_mapping_status["missing_step1_compound"] += 1
+            continue
+        step1_row = step1_rows[compound_id]
+        step1_variant_sets = step1_alias_variants.get(compound_id)
+        resolved_by = step1_row.get("resolved_by", "")
+        resolved_aracyc_compound_id = step1_row.get("aracyc_compound_id", "")
+        if resolved_aracyc_compound_id and resolved_by in {"inchikey", "chebi_xref", "kegg_xref"}:
+            record = aracyc_record_by_compound_id.get(resolved_aracyc_compound_id)
+            if record is not None:
+                best = _build_match(
+                    record,
+                    method=resolved_by,
+                    score=_exact_bridge_score(resolved_by),
+                    chebi_xref_direct=resolved_by == "chebi_xref",
+                    structure_validated=resolved_by == "inchikey",
+                )
+                context.aracyc_matches_by_compound[compound_id] = [best]
+                match_count += 1
+                method_counts[best.match_method] += 1
+                context.aracyc_mapping_status[f"matched_{best.source_db.lower()}"] += 1
+                continue
+            context.aracyc_mapping_status["step1_resolution_missing_record"] += 1
+
         matches = _match_one_compound(
-            compound_id, compound,
+            compound_id, compound, step1_variant_sets,
             context.xrefs, context.structures,
             aracyc_records, plantcyc_records,
             aracyc_chebi_idx, aracyc_kegg_idx,
-            aracyc_inchikey_idx, aracyc_fp_idx, aracyc_name_idx,
+            aracyc_inchikey_idx, aracyc_fp_idx, aracyc_formula_idx, aracyc_name_idx,
             plantcyc_chebi_idx, plantcyc_kegg_idx,
-            plantcyc_inchikey_idx, plantcyc_fp_idx, plantcyc_name_idx,
+            plantcyc_inchikey_idx, plantcyc_fp_idx, plantcyc_formula_idx, plantcyc_name_idx,
+            skip_exact_aracyc=True,
         )
 
         if matches:

@@ -47,7 +47,7 @@ VARIANT_ORDER = ("exact", "compact", "singular", "stereo_stripped")
 # D-glucose, "amines" as plural vs "amine" as a specific compound).
 CHEBI_STRICT_VARIANT_ORDER = ("exact", "compact")
 FUZZY_MIN_RATIO = 0.85
-FUZZY_AUTO_RATIO = 0.92
+FUZZY_AUTO_RATIO = 0.88
 FUZZY_MIN_GAP = 0.05
 FUZZY_MIN_NAME_LENGTH = 6
 SMILES_NEIGHBOR_MIN = 0.60

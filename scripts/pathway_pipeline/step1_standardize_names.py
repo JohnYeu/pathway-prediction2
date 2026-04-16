@@ -42,16 +42,18 @@ from process_chebi_to_pathways_v2 import (
     StructureInfo,
     XrefInfo,
     build_variants,
+    clean_markup,
     formula_key,
     keep_pubchem_synonym,
     normalize_chebi_id,
+    normalize_inchi_key,
     normalize_name,
     record_alias,
     split_multi_value,
 )
 
 from pathway_pipeline.cli_utils import build_context, build_parser, print_summary
-from pathway_pipeline.context import PipelineContext
+from pathway_pipeline.context import PipelineContext, Step1AraCycResolution
 
 
 def load_compounds(path: Path) -> dict[str, ChEBICompound]:
@@ -181,6 +183,139 @@ def load_structures(path: Path, formulas: dict[str, tuple[str, str]]) -> dict[st
             )
             preferred_default[compound_id] = is_default
     return structures
+
+
+def _filter_aracyc_records(records: dict[str, PlantCycCompound]) -> dict[str, PlantCycCompound]:
+    """Keep only AraCyc records from the mixed PMN record pool."""
+
+    return {record_id: record for record_id, record in records.items() if record.source_db == "AraCyc"}
+
+
+def _build_aracyc_chebi_index(records: dict[str, PlantCycCompound]) -> dict[str, set[str]]:
+    """Build CHEBI accession -> AraCyc record lookup for exact bridging."""
+
+    index: defaultdict[str, set[str]] = defaultdict(set)
+    for record_id, record in records.items():
+        for chebi_id in record.chebi_ids:
+            index[chebi_id].add(record_id)
+    return dict(index)
+
+
+def _build_aracyc_kegg_index(records: dict[str, PlantCycCompound]) -> dict[str, set[str]]:
+    """Build KEGG compound -> AraCyc record lookup for exact bridging."""
+
+    index: defaultdict[str, set[str]] = defaultdict(set)
+    for record_id, record in records.items():
+        for kegg_id in record.kegg_ids:
+            index[kegg_id].add(record_id)
+    return dict(index)
+
+
+def _build_aracyc_inchikey_index(
+    records: dict[str, PlantCycCompound],
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Build AraCyc SMILES-derived InChIKey lookups."""
+
+    index: defaultdict[str, set[str]] = defaultdict(set)
+    by_record: dict[str, str] = {}
+    try:
+        from rdkit import Chem
+        from rdkit.Chem.inchi import InchiToInchiKey, MolToInchi
+    except ImportError:
+        return {}, {}
+
+    for record_id, record in records.items():
+        if not record.smiles:
+            continue
+        try:
+            mol = Chem.MolFromSmiles(record.smiles)
+            if mol is None:
+                continue
+            inchi = MolToInchi(mol)
+            if not inchi:
+                continue
+            inchikey = normalize_inchi_key(InchiToInchiKey(inchi))
+            if not inchikey:
+                continue
+            index[inchikey].add(record_id)
+            by_record[record_id] = inchikey
+        except Exception:
+            continue
+
+    return dict(index), by_record
+
+
+def _preferred_aracyc_record_id(record_ids: set[str], records: dict[str, PlantCycCompound]) -> str:
+    """Pick one stable AraCyc record when multiple exact records are available."""
+
+    return min(
+        record_ids,
+        key=lambda record_id: (
+            -len(records[record_id].pathways),
+            records[record_id].compound_id,
+            record_id,
+        ),
+    )
+
+
+def _resolve_exact_aracyc_bridge(
+    *,
+    compound_id: str,
+    compound: ChEBICompound,
+    xref_info: XrefInfo,
+    structures: dict[str, StructureInfo],
+    aracyc_records: dict[str, PlantCycCompound],
+    aracyc_chebi_idx: dict[str, set[str]],
+    aracyc_kegg_idx: dict[str, set[str]],
+    aracyc_inchikey_idx: dict[str, set[str]],
+) -> Step1AraCycResolution | None:
+    """Resolve one ChEBI compound to AraCyc using only exact, lossless bridges."""
+
+    structure = structures.get(compound_id)
+    if structure and structure.standard_inchi_key:
+        inchikey = normalize_inchi_key(structure.standard_inchi_key)
+        record_ids = aracyc_inchikey_idx.get(inchikey, set())
+        if record_ids:
+            record_id = _preferred_aracyc_record_id(record_ids, aracyc_records)
+            return Step1AraCycResolution(
+                record_id=record_id,
+                aracyc_compound_id=aracyc_records[record_id].compound_id,
+                resolved_by="inchikey",
+            )
+
+    record_ids = aracyc_chebi_idx.get(compound.chebi_accession, set())
+    if record_ids:
+        record_id = _preferred_aracyc_record_id(record_ids, aracyc_records)
+        return Step1AraCycResolution(
+            record_id=record_id,
+            aracyc_compound_id=aracyc_records[record_id].compound_id,
+            resolved_by="chebi_xref",
+        )
+
+    for kegg_id in sorted(xref_info.kegg_ids):
+        record_ids = aracyc_kegg_idx.get(kegg_id, set())
+        if record_ids:
+            record_id = _preferred_aracyc_record_id(record_ids, aracyc_records)
+            return Step1AraCycResolution(
+                record_id=record_id,
+                aracyc_compound_id=aracyc_records[record_id].compound_id,
+                resolved_by="kegg_xref",
+            )
+
+    return None
+
+
+def _build_aracyc_aliases(record: PlantCycCompound) -> list[AliasRecord]:
+    """Materialize the display aliases for one native AraCyc record."""
+
+    alias_bucket: dict[str, AliasRecord] = {}
+    record_alias(alias_bucket, raw_name=record.common_name, source_type="aracyc_common_name", language_code="en")
+    cleaned_name = clean_markup(record.common_name).strip()
+    if cleaned_name and cleaned_name != record.common_name:
+        record_alias(alias_bucket, raw_name=cleaned_name, source_type="aracyc_ascii_name", language_code="en")
+    for synonym in sorted(record.synonyms):
+        record_alias(alias_bucket, raw_name=synonym, source_type="aracyc_synonym", language_code="en")
+    return list(alias_bucket.values())
 
 
 def build_name_formula_index(
@@ -696,6 +831,190 @@ def write_name_to_formula_index(context: PipelineContext, rows: dict[tuple[str, 
     return len(rows)
 
 
+def _join_sorted(values: set[str] | list[str] | tuple[str, ...]) -> str:
+    """Join a small multi-value field into a deterministic TSV cell."""
+
+    return ";".join(sorted({value for value in values if value}))
+
+
+def write_step1_unified_tables(
+    context: PipelineContext,
+    *,
+    aracyc_records: dict[str, PlantCycCompound],
+    aracyc_inchikey_by_record: dict[str, str],
+) -> tuple[int, int, int]:
+    """Write the entity-level and alias-level unified step-1 inspection tables."""
+
+    result_rows = 0
+    alias_rows = 0
+    aracyc_only_rows = 0
+    known_chebi_accessions = {compound.chebi_accession for compound in context.compounds.values()}
+    used_aracyc_record_ids = {resolution.record_id for resolution in context.step1_aracyc_resolutions.values()}
+
+    with (
+        context.paths.step1_result_path.open("w", newline="", encoding="utf-8") as result_handle,
+        context.paths.step1_alias_unified_path.open("w", newline="", encoding="utf-8") as alias_handle,
+    ):
+        result_writer = csv.DictWriter(
+            result_handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "aracyc_compound_id",
+                "entity_source",
+                "ara_tag",
+                "resolved_by",
+                "display_name",
+                "ascii_name",
+                "definition",
+                "formula",
+                "formula_key",
+                "smiles",
+                "standard_inchi_key",
+                "kegg_ids",
+                "pubchem_cids",
+                "hmdb_ids",
+                "alias_count",
+                "pathway_count",
+                "pathways",
+            ],
+            delimiter="\t",
+        )
+        result_writer.writeheader()
+
+        alias_writer = csv.DictWriter(
+            alias_handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "aracyc_compound_id",
+                "entity_source",
+                "ara_tag",
+                "resolved_by",
+                "display_name",
+                "alias",
+                "alias_source",
+                "normalized_name",
+                "compact_name",
+                "singular_name",
+                "stereo_stripped_name",
+            ],
+            delimiter="\t",
+        )
+        alias_writer.writeheader()
+
+        for compound_id in sorted(context.compounds, key=int):
+            compound = context.compounds[compound_id]
+            xref_info = context.xrefs.get(compound_id, XrefInfo())
+            structure = context.structures.get(compound_id)
+            compound_context = context.compound_contexts[compound_id]
+            resolution = context.step1_aracyc_resolutions.get(compound_id)
+            aracyc_record = aracyc_records.get(resolution.record_id) if resolution else None
+            pathways = tuple(sorted(aracyc_record.pathways)) if aracyc_record else ()
+            result_writer.writerow(
+                {
+                    "compound_id": compound_id,
+                    "chebi_accession": compound.chebi_accession,
+                    "aracyc_compound_id": resolution.aracyc_compound_id if resolution else "",
+                    "entity_source": "chebi",
+                    "ara_tag": "non-ara",
+                    "resolved_by": resolution.resolved_by if resolution else "",
+                    "display_name": compound.name,
+                    "ascii_name": compound.ascii_name,
+                    "definition": compound.definition,
+                    "formula": structure.formula if structure else "",
+                    "formula_key": structure.formula_key if structure else "",
+                    "smiles": structure.smiles if structure else "",
+                    "standard_inchi_key": structure.standard_inchi_key if structure else "",
+                    "kegg_ids": _join_sorted(xref_info.kegg_ids),
+                    "pubchem_cids": _join_sorted(compound_context.pubchem_cids),
+                    "hmdb_ids": _join_sorted(xref_info.hmdb_ids),
+                    "alias_count": len(compound_context.all_aliases),
+                    "pathway_count": len(pathways),
+                    "pathways": _join_sorted(pathways),
+                }
+            )
+            result_rows += 1
+
+            for alias in sorted(compound_context.all_aliases, key=lambda item: (item.source_type, item.raw_name)):
+                alias_writer.writerow(
+                    {
+                        "compound_id": compound_id,
+                        "chebi_accession": compound.chebi_accession,
+                        "aracyc_compound_id": resolution.aracyc_compound_id if resolution else "",
+                        "entity_source": "chebi",
+                        "ara_tag": "non-ara",
+                        "resolved_by": resolution.resolved_by if resolution else "",
+                        "display_name": compound.name,
+                        "alias": alias.raw_name,
+                        "alias_source": alias.source_type,
+                        "normalized_name": alias.exact,
+                        "compact_name": alias.compact,
+                        "singular_name": alias.singular,
+                        "stereo_stripped_name": alias.stereo_stripped,
+                    }
+                )
+                alias_rows += 1
+
+        for record_id in sorted(aracyc_records, key=lambda item: aracyc_records[item].compound_id):
+            record = aracyc_records[record_id]
+            if record_id in used_aracyc_record_ids:
+                continue
+            if record.chebi_ids & known_chebi_accessions:
+                continue
+
+            aracyc_only_rows += 1
+            aliases = _build_aracyc_aliases(record)
+            display_name = record.common_name
+            ascii_name = clean_markup(record.common_name).strip() or record.common_name
+            result_writer.writerow(
+                {
+                    "compound_id": "",
+                    "chebi_accession": min(record.chebi_ids) if record.chebi_ids else "",
+                    "aracyc_compound_id": record.compound_id,
+                    "entity_source": "aracyc",
+                    "ara_tag": "ara",
+                    "resolved_by": "native",
+                    "display_name": display_name,
+                    "ascii_name": ascii_name,
+                    "definition": "",
+                    "formula": record.formula,
+                    "formula_key": record.formula_key,
+                    "smiles": record.smiles,
+                    "standard_inchi_key": aracyc_inchikey_by_record.get(record_id, ""),
+                    "kegg_ids": _join_sorted(record.kegg_ids),
+                    "pubchem_cids": _join_sorted(record.pubchem_cids),
+                    "hmdb_ids": _join_sorted(record.hmdb_ids),
+                    "alias_count": len(aliases),
+                    "pathway_count": len(record.pathways),
+                    "pathways": _join_sorted(record.pathways),
+                }
+            )
+            result_rows += 1
+
+            for alias in sorted(aliases, key=lambda item: (item.source_type, item.raw_name)):
+                alias_writer.writerow(
+                    {
+                        "compound_id": "",
+                        "chebi_accession": min(record.chebi_ids) if record.chebi_ids else "",
+                        "aracyc_compound_id": record.compound_id,
+                        "entity_source": "aracyc",
+                        "ara_tag": "ara",
+                        "resolved_by": "native",
+                        "display_name": display_name,
+                        "alias": alias.raw_name,
+                        "alias_source": alias.source_type,
+                        "normalized_name": alias.exact,
+                        "compact_name": alias.compact,
+                        "singular_name": alias.singular,
+                        "stereo_stripped_name": alias.stereo_stripped,
+                    }
+                )
+                alias_rows += 1
+
+    return result_rows, alias_rows, aracyc_only_rows
+
+
 def run(context: PipelineContext) -> PipelineContext:
     """Load alias sources and write the normalized alias table.
 
@@ -749,6 +1068,10 @@ def run(context: PipelineContext) -> PipelineContext:
             ("PlantCyc", paths.plantcyc_compounds_path),
         ]
     )
+    aracyc_records = _filter_aracyc_records(context.plantcyc_records)
+    aracyc_chebi_idx = _build_aracyc_chebi_index(aracyc_records)
+    aracyc_kegg_idx = _build_aracyc_kegg_index(aracyc_records)
+    aracyc_inchikey_idx, aracyc_inchikey_by_record = _build_aracyc_inchikey_index(aracyc_records)
 
     # Load LIPID MAPS records. This is especially important for lipid-like
     # compounds where names alone are often too ambiguous.
@@ -845,13 +1168,46 @@ def run(context: PipelineContext) -> PipelineContext:
     # steps and for the final JSON summary.
     context.compound_contexts = compound_contexts
     context.alias_rows = alias_rows
+    resolution_counts: Counter[str] = Counter()
+    step1_resolutions: dict[str, Step1AraCycResolution] = {}
+    for compound_id in sorted(context.compounds, key=int):
+        compound = context.compounds[compound_id]
+        resolution = _resolve_exact_aracyc_bridge(
+            compound_id=compound_id,
+            compound=compound,
+            xref_info=context.xrefs.get(compound_id, XrefInfo()),
+            structures=context.structures,
+            aracyc_records=aracyc_records,
+            aracyc_chebi_idx=aracyc_chebi_idx,
+            aracyc_kegg_idx=aracyc_kegg_idx,
+            aracyc_inchikey_idx=aracyc_inchikey_idx,
+        )
+        if resolution is None:
+            continue
+        step1_resolutions[compound_id] = resolution
+        resolution_counts[resolution.resolved_by] += 1
+    context.step1_aracyc_resolutions = step1_resolutions
+
+    step1_result_rows, step1_alias_unified_rows, step1_aracyc_only_rows = write_step1_unified_tables(
+        context,
+        aracyc_records=aracyc_records,
+        aracyc_inchikey_by_record=aracyc_inchikey_by_record,
+    )
+
     context.preprocess_counts["compounds_total"] = len(context.compounds)
     context.preprocess_counts["comments_profile_keys"] = len(context.comments_profile)
+    context.preprocess_counts["step1_result_rows"] = step1_result_rows
+    context.preprocess_counts["step1_alias_unified_rows"] = step1_alias_unified_rows
+    context.preprocess_counts["step1_aracyc_only_rows"] = step1_aracyc_only_rows
+    context.preprocess_counts["step1_exact_aracyc_resolved"] = len(step1_resolutions)
+    for method, count in sorted(resolution_counts.items()):
+        context.preprocess_counts[f"step1_resolved_{method}"] = count
     context.preprocess_counts["name_normalization_index"] = write_name_normalization_index(context)
     formula_rows = aggregate_name_formula_rows(context)
     context.preprocess_counts["name_to_formula_index"] = write_name_to_formula_index(context, formula_rows)
     context.preprocess_counts["pubchem_target_cids"] = context.pubchem_stats.get("target_cids", 0)
     context.add_note("Step 1 wrote the standardized alias table before downstream compound matching.")
+    context.add_note("Step 1 also wrote unified AraCyc-aware inspection tables and exact AraCyc bridges.")
     return context
 
 
@@ -874,10 +1230,13 @@ def main() -> None:
         "Step 1 completed.",
         [
             f"Alias table: {context.paths.alias_output_path}",
+            f"Unified entity table: {context.paths.step1_result_path}",
+            f"Unified alias table: {context.paths.step1_alias_unified_path}",
             f"Name normalization index: {context.paths.name_normalization_index_path}",
             f"Name-to-formula index: {context.paths.name_to_formula_index_path}",
             f"Compounds loaded: {len(context.compounds)}",
             f"Alias rows written: {context.alias_rows}",
+            f"Step 1 exact AraCyc bridges: {len(context.step1_aracyc_resolutions)}",
             f"PubChem synonym CIDs loaded: {context.pubchem_stats.get('target_cids', 0)}",
         ],
     )
