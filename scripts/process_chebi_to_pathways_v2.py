@@ -54,6 +54,20 @@ PATHWAY_LINE_RE = re.compile(r"^C\s+(\d{5})\s+(.+)$")
 GO_ID_RE = re.compile(r"^GO:\d{7}$")
 AGI_LOCUS_RE = re.compile(r"\bAT[1-5CM]G\d{5}\b", re.IGNORECASE)
 
+
+def latest_versioned_ref(refs: Path, prefix: str, fallback_name: str) -> Path:
+    """Return the newest versioned reference file available in refs/."""
+
+    fallback = refs / fallback_name
+    candidates = [
+        path
+        for path in refs.glob(f"{prefix}.*")
+        if path.is_file() and path.name[len(prefix) + 1 :].isdigit()
+    ]
+    if not candidates:
+        return fallback
+    return max(candidates, key=lambda path: path.name)
+
 ALLOWED_CHEBI_ALIAS_TYPES = {"SYNONYM", "IUPAC NAME", "INN"}
 VARIANT_ORDER = ("exact", "compact", "singular", "stereo_stripped")
 FUZZY_VARIANT_ORDER = ("exact", "singular", "stereo_stripped")
@@ -2245,6 +2259,10 @@ def main() -> None:
     refs = workdir / "refs"
     outputs = workdir / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
+    aracyc_compounds_path = latest_versioned_ref(refs, "aracyc_compounds", "aracyc_compounds.20230103")
+    aracyc_pathways_path = latest_versioned_ref(refs, "aracyc_pathways", "aracyc_pathways.20230103")
+    plantcyc_compounds_path = latest_versioned_ref(refs, "plantcyc_compounds", "plantcyc_compounds.20220103")
+    plantcyc_pathways_path = latest_versioned_ref(refs, "plantcyc_pathways", "plantcyc_pathways.20230103")
 
     required_paths = [
         workdir / "compounds.tsv",
@@ -2261,10 +2279,10 @@ def main() -> None:
         refs / "kegg_ath_gene_pathway.tsv",
         refs / "pubchem_cid_synonym_filtered.gz",
         refs / "lmsd_extended.sdf.zip",
-        refs / "aracyc_compounds.20230103",
-        refs / "aracyc_pathways.20230103",
-        refs / "plantcyc_compounds.20220103",
-        refs / "plantcyc_pathways.20230103",
+        aracyc_compounds_path,
+        aracyc_pathways_path,
+        plantcyc_compounds_path,
+        plantcyc_pathways_path,
         refs / "ReactomePathways.txt",
     ]
     for required_path in required_paths:
@@ -2305,14 +2323,14 @@ def main() -> None:
     ath_gene_counts = load_ath_gene_counts(refs / "kegg_ath_gene_pathway.tsv")
     plantcyc_records, plantcyc_indexes, plantcyc_pubchem_cids = load_plantcyc_compounds(
         [
-            ("AraCyc", refs / "aracyc_compounds.20230103"),
-            ("PlantCyc", refs / "plantcyc_compounds.20220103"),
+            ("AraCyc", aracyc_compounds_path),
+            ("PlantCyc", plantcyc_compounds_path),
         ]
     )
     plantcyc_pathway_stats = load_plantcyc_pathway_stats(
         [
-            ("AraCyc", refs / "aracyc_pathways.20230103"),
-            ("PlantCyc", refs / "plantcyc_pathways.20230103"),
+            ("AraCyc", aracyc_pathways_path),
+            ("PlantCyc", plantcyc_pathways_path),
         ]
     )
     lipidmaps_records, lipidmaps_indexes, lipidmaps_pubchem_cids = load_lipidmaps_records(refs / "lmsd_extended.sdf.zip")

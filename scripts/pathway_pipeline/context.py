@@ -23,6 +23,20 @@ from process_chebi_to_pathways_v2 import (
 )
 
 
+def _latest_versioned_ref(refs: Path, prefix: str, fallback_name: str) -> Path:
+    """Return the newest versioned reference file available in refs/."""
+
+    fallback = refs / fallback_name
+    candidates = [
+        path
+        for path in refs.glob(f"{prefix}.*")
+        if path.is_file() and path.name[len(prefix) + 1 :].isdigit()
+    ]
+    if not candidates:
+        return fallback
+    return max(candidates, key=lambda path: path.name)
+
+
 @dataclass(slots=True)
 class Step3PathwayHit:
     """Raw KEGG compound -> map pathway expansion before ath resolution."""
@@ -386,6 +400,10 @@ class PipelinePaths:
         preprocessed_history_dir = preprocessed_dir / "history"
         preprocessed_history_dir.mkdir(parents=True, exist_ok=True)
         suffix = f"_{output_tag}" if output_tag else ""
+        aracyc_compounds_path = _latest_versioned_ref(refs, "aracyc_compounds", "aracyc_compounds.20230103")
+        aracyc_pathways_path = _latest_versioned_ref(refs, "aracyc_pathways", "aracyc_pathways.20230103")
+        plantcyc_compounds_path = _latest_versioned_ref(refs, "plantcyc_compounds", "plantcyc_compounds.20220103")
+        plantcyc_pathways_path = _latest_versioned_ref(refs, "plantcyc_pathways", "plantcyc_pathways.20230103")
         return cls(
             workdir=workdir,
             refs=refs,
@@ -412,10 +430,10 @@ class PipelinePaths:
             gene_association_tair_path=refs / "gene_association.tair.gz",
             pubchem_synonyms_path=refs / "pubchem_cid_synonym_filtered.gz",
             lipidmaps_sdf_path=refs / "lmsd_extended.sdf.zip",
-            aracyc_compounds_path=refs / "aracyc_compounds.20230103",
-            aracyc_pathways_path=refs / "aracyc_pathways.20230103",
-            plantcyc_compounds_path=refs / "plantcyc_compounds.20220103",
-            plantcyc_pathways_path=refs / "plantcyc_pathways.20230103",
+            aracyc_compounds_path=aracyc_compounds_path,
+            aracyc_pathways_path=aracyc_pathways_path,
+            plantcyc_compounds_path=plantcyc_compounds_path,
+            plantcyc_pathways_path=plantcyc_pathways_path,
             reactome_pathways_path=refs / "ReactomePathways.txt",
             plant_reactome_pathways_path=refs / "plant_reactome_pathways.tsv",
             plant_reactome_gene_pathway_path=refs / "plant_reactome_gene_pathway.tsv",

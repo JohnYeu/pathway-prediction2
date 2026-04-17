@@ -217,7 +217,7 @@ def run(context: PipelineContext) -> PipelineContext:
             context.aracyc_pathway_info[pid] = info
         print(f"    PlantCyc pathways loaded: {len(plantcyc_pathway_info)}", flush=True)
     else:
-        print("    Optional input missing: plantcyc_pathways.20230103; skipping PlantCyc pathway corroboration.", flush=True)
+        print("    Optional input missing: PlantCyc pathways file; skipping PlantCyc pathway corroboration.", flush=True)
 
     # Read per-row compound-pathway detail from raw files
     aracyc_detail = _read_compound_pathway_detail(context.paths.aracyc_compounds_path)
