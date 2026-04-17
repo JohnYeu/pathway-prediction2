@@ -1,4 +1,4 @@
-"""Step 6 (AraCyc-first): ML supplemental recall for compounds without AraCyc pathway hits.
+"""Step 6 (AraCyc-first, deprecated experimental path): ML supplemental recall.
 
 This step supplements the AraCyc primary chain with ML-scored expanded
 candidates. Feature extraction and model training are self-contained.

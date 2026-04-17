@@ -20,7 +20,6 @@ from pathway_pipeline import (
     step3_link_compounds_to_pathways,
     step4_annotate_pathways,
     step5_score_pathways,
-    step6_ml_recall,
     step7_output_results,
 )
 
@@ -47,8 +46,6 @@ def run_pipeline(context: PipelineContext) -> None:
     step4_annotate_pathways.run(context)
     print("Scoring AraCyc pathway hits...", flush=True)
     step5_score_pathways.run(context)
-    print("Running ML supplemental recall...", flush=True)
-    step6_ml_recall.run(context)
     print("Writing outputs...", flush=True)
     step7_output_results.run(context)
 
