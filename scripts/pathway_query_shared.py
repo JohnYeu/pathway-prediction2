@@ -115,6 +115,21 @@ class QueryPathway:
     reason: str
     support_similarity: float = 1.0
     recovered_chebi_id: str = ""
+    kegg_support_present: bool = False
+    kegg_ath_pathway_id: str = ""
+    kegg_ath_pathway_name: str = ""
+    kegg_alignment_score: float = 0.0
+    kegg_alignment_confidence: str = ""
+
+
+@dataclass(slots=True)
+class KeggPathwaySupport:
+    """Best KEGG ath support annotation for one AraCyc pathway."""
+
+    ath_pathway_id: str
+    ath_pathway_name: str
+    alignment_score: float
+    alignment_confidence: str
 
 
 @dataclass(slots=True)
@@ -588,6 +603,30 @@ def load_expanded_predictions(path: Path) -> dict[str, list[ExpandedPathway]]:
     return result
 
 
+def load_kegg_pathway_support(path: Path) -> dict[str, KeggPathwaySupport]:
+    """Load best KEGG ath -> AraCyc alignments as AraCyc -> best KEGG support."""
+    result: dict[str, KeggPathwaySupport] = {}
+    if not path.exists():
+        return result
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            aracyc_pathway_id = (row.get("aracyc_pathway_id") or "").strip()
+            if not aracyc_pathway_id:
+                continue
+            support = KeggPathwaySupport(
+                ath_pathway_id=(row.get("ath_pathway_id") or "").strip(),
+                ath_pathway_name=(row.get("ath_pathway_name") or "").strip(),
+                alignment_score=float(row.get("alignment_score") or 0.0),
+                alignment_confidence=(row.get("alignment_confidence") or "").strip(),
+            )
+            existing = result.get(aracyc_pathway_id)
+            if existing is None or support.alignment_score > existing.alignment_score:
+                result[aracyc_pathway_id] = support
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Lazy query caches
 # ---------------------------------------------------------------------------
@@ -777,7 +816,10 @@ def ensure_arabidopsis_structure_index(state: dict[str, Any], verbose: bool = Fa
 
     workdir = state["workdir"]
     cache_path = workdir / "outputs" / "preprocessed" / "query_arabidopsis_structure_index.pkl"
-    pathway_output_path = workdir / "outputs" / "chebi_pathways_aracyc_refactored.tsv"
+    pathway_tables_dir = workdir / "outputs" / "pathwayTables"
+    pathway_output_path = pathway_tables_dir / "chebi_pathways_aracyc_refactored.tsv"
+    legacy_pathway_output_path = workdir / "outputs" / "chebi_pathways_aracyc_refactored.tsv"
+    active_pathway_output_path = pathway_output_path if pathway_output_path.exists() else legacy_pathway_output_path
     structures_path = workdir / "refs" / "structures.tsv.gz"
     compounds_path = workdir / "compounds.tsv"
     chemical_data_path = workdir / "refs" / "chemical_data.tsv.gz"
@@ -810,7 +852,7 @@ def ensure_arabidopsis_structure_index(state: dict[str, Any], verbose: bool = Fa
         builder,
         "query_arabidopsis_structure_index.pkl",
         verbose,
-        sources=[pathway_output_path, structures_path, compounds_path, chemical_data_path],
+        sources=[active_pathway_output_path, structures_path, compounds_path, chemical_data_path],
     )
     records: list[StructureRecord] = []
     by_full_inchikey: dict[str, list[StructureRecord]] = {}
@@ -959,6 +1001,7 @@ def aggregate_primary_pathways(
 ) -> list[QueryPathway]:
     """Aggregate primary pathways from supporting Arabidopsis compounds."""
     pathway_index: dict[str, list[AraCycRankedPathway]] = state["pathway_index"]
+    kegg_support_lookup: dict[str, KeggPathwaySupport] = state.get("kegg_pathway_support", {})
     aggregated: dict[str, QueryPathway] = {}
 
     for neighbor in neighbors:
@@ -968,6 +1011,7 @@ def aggregate_primary_pathways(
             existing = aggregated.get(key)
             if existing is not None and predicted_score <= existing.score:
                 continue
+            kegg_support = kegg_support_lookup.get(pathway.pathway_id)
             aggregated[key] = QueryPathway(
                 compound_id=pathway.compound_id,
                 chebi_name=pathway.chebi_name,
@@ -989,6 +1033,11 @@ def aggregate_primary_pathways(
                 ),
                 support_similarity=neighbor.similarity,
                 recovered_chebi_id=neighbor.recovered_chebi_id,
+                kegg_support_present=kegg_support is not None,
+                kegg_ath_pathway_id=kegg_support.ath_pathway_id if kegg_support is not None else "",
+                kegg_ath_pathway_name=kegg_support.ath_pathway_name if kegg_support is not None else "",
+                kegg_alignment_score=kegg_support.alignment_score if kegg_support is not None else 0.0,
+                kegg_alignment_confidence=kegg_support.alignment_confidence if kegg_support is not None else "",
             )
 
     results = sorted(
@@ -1476,6 +1525,12 @@ def print_result(result: QueryResult, top_k: int = 10) -> None:
             print(f"  #{index} [{pathway.confidence_level}] {pathway.pathway_name}")
             print(f"     score={pathway.score:.3f}, category={pathway.pathway_category}{genes}{ec}{similarity}")
             print(f"     via CHEBI:{pathway.compound_id} -> {pathway.aracyc_compound_id} [{pathway.source_db}, {pathway.match_method}]")
+            if pathway.kegg_support_present:
+                print(
+                    "     "
+                    f"KEGG ath support: {pathway.kegg_ath_pathway_id} ({pathway.kegg_ath_pathway_name}) "
+                    f"[{pathway.kegg_alignment_confidence}, score={pathway.kegg_alignment_score:.4f}]"
+                )
     else:
         print("\n  No pathways found in primary chain.")
 
@@ -1494,10 +1549,14 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, An
     """Load the active preprocessed indexes for query-time use."""
     preprocessed_dir = workdir / "outputs" / "preprocessed"
     outputs_dir = workdir / "outputs"
+    pathway_tables_dir = outputs_dir / "pathwayTables"
 
     name_to_aracyc_path = preprocessed_dir / "name_to_aracyc_index.tsv"
-    pathway_output_path = outputs_dir / "chebi_pathways_aracyc_refactored.tsv"
+    pathway_output_path = pathway_tables_dir / "chebi_pathways_aracyc_refactored.tsv"
+    if not pathway_output_path.exists():
+        pathway_output_path = outputs_dir / "chebi_pathways_aracyc_refactored.tsv"
     expanded_path = preprocessed_dir / "ml_pathway_predictions.tsv"
+    kegg_support_path = preprocessed_dir / "kegg_ath_to_aracyc_pathway_best.tsv"
 
     if verbose:
         print(f"Loading AraCyc indexes from {preprocessed_dir}...", flush=True)
@@ -1510,6 +1569,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, An
             "compound_index": {},
             "pathway_index": {},
             "expanded_index": {},
+            "kegg_pathway_support": {},
             "arabidopsis_name_texts": (),
             "chebi_name_lookup": None,
             "chebi_structure_lookup": None,
@@ -1519,6 +1579,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, An
     name_index, compound_index = load_name_to_aracyc(name_to_aracyc_path)
     pathway_index = load_pathway_output(pathway_output_path)
     expanded_index = load_expanded_predictions(expanded_path)
+    kegg_pathway_support = load_kegg_pathway_support(kegg_support_path)
 
     if verbose:
         print(f"  Name index: {len(name_index)} entries", flush=True)
@@ -1528,6 +1589,10 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, An
             print(f"  Expanded index: {len(expanded_index)} compounds", flush=True)
         else:
             print("  Expanded index: unavailable (run step6_ml_recall.py separately)", flush=True)
+        if kegg_support_path.exists():
+            print(f"  KEGG pathway support: {len(kegg_pathway_support)} AraCyc pathways annotated", flush=True)
+        else:
+            print(f"  Warning: {kegg_support_path} not found. KEGG support annotations disabled.", flush=True)
 
     return {
         "workdir": workdir,
@@ -1535,6 +1600,7 @@ def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, An
         "compound_index": compound_index,
         "pathway_index": pathway_index,
         "expanded_index": expanded_index,
+        "kegg_pathway_support": kegg_pathway_support,
         "arabidopsis_name_texts": tuple(sorted(name_index)),
         "chebi_name_lookup": None,
         "chebi_structure_lookup": None,

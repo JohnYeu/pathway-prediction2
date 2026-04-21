@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pathway_query_shared import load_preprocessed_state, resolve_primary_compound
+from pathway_query_shared import KeggPathwaySupport, load_preprocessed_state, resolve_primary_compound
 
 
 DONE_SENTINEL = "DONE"
@@ -73,6 +73,11 @@ class PathwayEnrichmentRow:
     confidence_level: str
     hit_compound_ids: tuple[str, ...]
     hit_compound_names: tuple[str, ...]
+    kegg_support_present: bool
+    kegg_ath_pathway_id: str
+    kegg_ath_pathway_name: str
+    kegg_alignment_score: float
+    kegg_alignment_confidence: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -279,6 +284,7 @@ def _compute_enrichment(
     universe_tokens: set[str],
     target_tokens: set[str],
     compound_records: dict[str, CompoundTargetRecord],
+    kegg_support_lookup: dict[str, KeggPathwaySupport],
 ) -> list[PathwayEnrichmentRow]:
     N = len(universe_tokens)
     n = len(target_tokens)
@@ -356,6 +362,7 @@ def _compute_enrichment(
             + 0.30 * row["coverage"]
             + 0.15 * row["mapping_confidence_mean"]
         )
+        kegg_support = kegg_support_lookup.get(row["pathway_id"])
         results.append(
             PathwayEnrichmentRow(
                 pathway_id=row["pathway_id"],
@@ -386,6 +393,11 @@ def _compute_enrichment(
                 confidence_level=_confidence_level(row["x_i"], row["fdr"]),
                 hit_compound_ids=row["hit_compound_ids"],
                 hit_compound_names=row["hit_compound_names"],
+                kegg_support_present=kegg_support is not None,
+                kegg_ath_pathway_id=kegg_support.ath_pathway_id if kegg_support is not None else "",
+                kegg_ath_pathway_name=kegg_support.ath_pathway_name if kegg_support is not None else "",
+                kegg_alignment_score=kegg_support.alignment_score if kegg_support is not None else 0.0,
+                kegg_alignment_confidence=kegg_support.alignment_confidence if kegg_support is not None else "",
             )
         )
 
@@ -478,6 +490,11 @@ def _write_enrichment_output(path: Path, rows: list[PathwayEnrichmentRow], warni
                 "confidence_level",
                 "hit_compound_ids",
                 "hit_compound_names",
+                "kegg_support_present",
+                "kegg_ath_pathway_id",
+                "kegg_ath_pathway_name",
+                "kegg_alignment_score",
+                "kegg_alignment_confidence",
             ],
             delimiter="\t",
         )
@@ -513,6 +530,11 @@ def _write_enrichment_output(path: Path, rows: list[PathwayEnrichmentRow], warni
                     "confidence_level": row.confidence_level,
                     "hit_compound_ids": ";".join(row.hit_compound_ids),
                     "hit_compound_names": "; ".join(row.hit_compound_names),
+                    "kegg_support_present": str(row.kegg_support_present).lower(),
+                    "kegg_ath_pathway_id": row.kegg_ath_pathway_id,
+                    "kegg_ath_pathway_name": row.kegg_ath_pathway_name,
+                    "kegg_alignment_score": f"{row.kegg_alignment_score:.6g}" if row.kegg_support_present else "",
+                    "kegg_alignment_confidence": row.kegg_alignment_confidence,
                 }
             )
 
@@ -535,6 +557,7 @@ def main() -> None:
         raise SystemExit("No compound names provided.")
 
     state = load_preprocessed_state(workdir, verbose=True)
+    kegg_support_lookup: dict[str, KeggPathwaySupport] = state.get("kegg_pathway_support", {})
     pathway_index_path = workdir / "outputs" / "preprocessed" / "aracyc_compound_pathway_index.tsv"
     pathway_names, pathway_to_tokens, universe_tokens = _load_pathway_membership(pathway_index_path)
 
@@ -551,6 +574,7 @@ def main() -> None:
         universe_tokens,
         target_tokens,
         compound_records,
+        kegg_support_lookup,
     )
 
     input_list_path = out_prefix.with_name(out_prefix.name + "_input_compounds.txt")
@@ -594,6 +618,13 @@ def main() -> None:
                 f"    hits: {'; '.join(row.hit_compound_names)}",
                 flush=True,
             )
+            if row.kegg_support_present:
+                print(
+                    "    "
+                    f"KEGG ath support: {row.kegg_ath_pathway_id} ({row.kegg_ath_pathway_name}) "
+                    f"[{row.kegg_alignment_confidence}, score={row.kegg_alignment_score:.4f}]",
+                    flush=True,
+                )
     else:
         print("No enriched pathways passed x_i >= 2.", flush=True)
 
