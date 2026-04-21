@@ -11,7 +11,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pathway_query_shared import KeggPathwaySupport, load_preprocessed_state, resolve_primary_compound
+from compound_set_rerank_shared import (
+    ONLINE_CANDIDATE_POLICY,
+    load_online_model_bundle,
+    load_parent_map,
+    predict_rerank_scores,
+    query_level_features_from_compound_ids,
+    rerank_feature_values,
+)
+from pathway_query_shared import (
+    KeggPathwaySupport,
+    ensure_chebi_structure_lookup,
+    load_preprocessed_state,
+    resolve_primary_compound,
+)
 
 
 DONE_SENTINEL = "DONE"
@@ -73,11 +86,11 @@ class PathwayEnrichmentRow:
     confidence_level: str
     hit_compound_ids: tuple[str, ...]
     hit_compound_names: tuple[str, ...]
-    kegg_support_present: bool
-    kegg_ath_pathway_id: str
-    kegg_ath_pathway_name: str
-    kegg_alignment_score: float
-    kegg_alignment_confidence: str
+    kegg_support_present: bool = False
+    kegg_ath_pathway_id: str = ""
+    kegg_ath_pathway_name: str = ""
+    kegg_alignment_score: float = 0.0
+    kegg_alignment_confidence: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -284,7 +297,7 @@ def _compute_enrichment(
     universe_tokens: set[str],
     target_tokens: set[str],
     compound_records: dict[str, CompoundTargetRecord],
-    kegg_support_lookup: dict[str, KeggPathwaySupport],
+    kegg_support_lookup: dict[str, KeggPathwaySupport] | None = None,
 ) -> list[PathwayEnrichmentRow]:
     N = len(universe_tokens)
     n = len(target_tokens)
@@ -355,6 +368,7 @@ def _compute_enrichment(
     ef_logs = {row["pathway_id"]: math.log2(max(row["enrichment_factor"], 1.0)) for row in raw_rows}
     ef_norm = _normalized_ef(ef_logs)
 
+    support_lookup = kegg_support_lookup or {}
     results: list[PathwayEnrichmentRow] = []
     for row in raw_rows:
         final_score = (
@@ -362,7 +376,7 @@ def _compute_enrichment(
             + 0.30 * row["coverage"]
             + 0.15 * row["mapping_confidence_mean"]
         )
-        kegg_support = kegg_support_lookup.get(row["pathway_id"])
+        kegg_support = support_lookup.get(row["pathway_id"])
         results.append(
             PathwayEnrichmentRow(
                 pathway_id=row["pathway_id"],
@@ -454,87 +468,158 @@ def _write_resolution_output(path: Path, rows: list[InputMetaboliteRow]) -> None
             )
 
 
-def _write_enrichment_output(path: Path, rows: list[PathwayEnrichmentRow], warning: str = "") -> None:
+def _enrichment_output_fieldnames() -> list[str]:
+    return [
+        "pathway_id",
+        "pathway_name",
+        "baseline_rank",
+        "ml_score",
+        "ml_rank",
+        "rerank_applied",
+        "rerank_reason",
+        "model_kind",
+        "x_i",
+        "K_i",
+        "n",
+        "N",
+        "target_rate",
+        "background_rate",
+        "expected_hits",
+        "excess_hits",
+        "enrichment_factor",
+        "coverage",
+        "p_value",
+        "fdr",
+        "neg_log10_p",
+        "neg_log10_fdr",
+        "mapping_confidence_mean",
+        "mapping_confidence_min",
+        "mapping_confidence_max",
+        "direct_hit_count",
+        "fuzzy_hit_count",
+        "recovered_hit_count",
+        "exact_structure_hit_count",
+        "structural_neighbor_hit_count",
+        "final_score",
+        "confidence_level",
+        "hit_compound_ids",
+        "hit_compound_names",
+        "kegg_support_present",
+        "kegg_ath_pathway_id",
+        "kegg_ath_pathway_name",
+        "kegg_alignment_score",
+        "kegg_alignment_confidence",
+    ]
+
+
+def _enrichment_output_row(
+    row: PathwayEnrichmentRow,
+    *,
+    baseline_rank: int,
+    ml_score: float | None,
+    ml_rank: int | None,
+    rerank_applied: bool,
+    rerank_reason: str,
+    model_kind: str,
+) -> dict[str, Any]:
+    return {
+        "pathway_id": row.pathway_id,
+        "pathway_name": row.pathway_name,
+        "baseline_rank": baseline_rank,
+        "ml_score": ml_score,
+        "ml_rank": ml_rank,
+        "rerank_applied": rerank_applied,
+        "rerank_reason": rerank_reason,
+        "model_kind": model_kind,
+        "x_i": row.x_i,
+        "K_i": row.K_i,
+        "n": row.n,
+        "N": row.N,
+        "target_rate": row.target_rate,
+        "background_rate": row.background_rate,
+        "expected_hits": row.expected_hits,
+        "excess_hits": row.excess_hits,
+        "enrichment_factor": row.enrichment_factor,
+        "coverage": row.coverage,
+        "p_value": row.p_value,
+        "fdr": row.fdr,
+        "neg_log10_p": row.neg_log10_p,
+        "neg_log10_fdr": row.neg_log10_fdr,
+        "mapping_confidence_mean": row.mapping_confidence_mean,
+        "mapping_confidence_min": row.mapping_confidence_min,
+        "mapping_confidence_max": row.mapping_confidence_max,
+        "direct_hit_count": row.direct_hit_count,
+        "fuzzy_hit_count": row.fuzzy_hit_count,
+        "recovered_hit_count": row.recovered_hit_count,
+        "exact_structure_hit_count": row.exact_structure_hit_count,
+        "structural_neighbor_hit_count": row.structural_neighbor_hit_count,
+        "final_score": row.final_score,
+        "confidence_level": row.confidence_level,
+        "hit_compound_ids": ";".join(row.hit_compound_ids),
+        "hit_compound_names": "; ".join(row.hit_compound_names),
+        "kegg_support_present": row.kegg_support_present,
+        "kegg_ath_pathway_id": row.kegg_ath_pathway_id,
+        "kegg_ath_pathway_name": row.kegg_ath_pathway_name,
+        "kegg_alignment_score": row.kegg_alignment_score,
+        "kegg_alignment_confidence": row.kegg_alignment_confidence,
+    }
+
+
+def _write_enrichment_output(path: Path, rows: list[dict[str, Any]], warning: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         if warning:
             handle.write(f"# WARNING: {warning}\n")
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "pathway_id",
-                "pathway_name",
-                "x_i",
-                "K_i",
-                "n",
-                "N",
-                "target_rate",
-                "background_rate",
-                "expected_hits",
-                "excess_hits",
-                "enrichment_factor",
-                "coverage",
-                "p_value",
-                "fdr",
-                "neg_log10_p",
-                "neg_log10_fdr",
-                "mapping_confidence_mean",
-                "mapping_confidence_min",
-                "mapping_confidence_max",
-                "direct_hit_count",
-                "fuzzy_hit_count",
-                "recovered_hit_count",
-                "exact_structure_hit_count",
-                "structural_neighbor_hit_count",
-                "final_score",
-                "confidence_level",
-                "hit_compound_ids",
-                "hit_compound_names",
-                "kegg_support_present",
-                "kegg_ath_pathway_id",
-                "kegg_ath_pathway_name",
-                "kegg_alignment_score",
-                "kegg_alignment_confidence",
-            ],
+            fieldnames=_enrichment_output_fieldnames(),
             delimiter="\t",
         )
         writer.writeheader()
         for row in rows:
             writer.writerow(
                 {
-                    "pathway_id": row.pathway_id,
-                    "pathway_name": row.pathway_name,
-                    "x_i": row.x_i,
-                    "K_i": row.K_i,
-                    "n": row.n,
-                    "N": row.N,
-                    "target_rate": f"{row.target_rate:.6g}",
-                    "background_rate": f"{row.background_rate:.6g}",
-                    "expected_hits": f"{row.expected_hits:.6g}",
-                    "excess_hits": f"{row.excess_hits:.6g}",
-                    "enrichment_factor": f"{row.enrichment_factor:.6g}",
-                    "coverage": f"{row.coverage:.6g}",
-                    "p_value": f"{row.p_value:.6g}",
-                    "fdr": f"{row.fdr:.6g}",
-                    "neg_log10_p": f"{row.neg_log10_p:.6g}",
-                    "neg_log10_fdr": f"{row.neg_log10_fdr:.6g}",
-                    "mapping_confidence_mean": f"{row.mapping_confidence_mean:.6g}",
-                    "mapping_confidence_min": f"{row.mapping_confidence_min:.6g}",
-                    "mapping_confidence_max": f"{row.mapping_confidence_max:.6g}",
-                    "direct_hit_count": row.direct_hit_count,
-                    "fuzzy_hit_count": row.fuzzy_hit_count,
-                    "recovered_hit_count": row.recovered_hit_count,
-                    "exact_structure_hit_count": row.exact_structure_hit_count,
-                    "structural_neighbor_hit_count": row.structural_neighbor_hit_count,
-                    "final_score": f"{row.final_score:.4f}",
-                    "confidence_level": row.confidence_level,
-                    "hit_compound_ids": ";".join(row.hit_compound_ids),
-                    "hit_compound_names": "; ".join(row.hit_compound_names),
-                    "kegg_support_present": str(row.kegg_support_present).lower(),
-                    "kegg_ath_pathway_id": row.kegg_ath_pathway_id,
-                    "kegg_ath_pathway_name": row.kegg_ath_pathway_name,
-                    "kegg_alignment_score": f"{row.kegg_alignment_score:.6g}" if row.kegg_support_present else "",
-                    "kegg_alignment_confidence": row.kegg_alignment_confidence,
+                    "pathway_id": row["pathway_id"],
+                    "pathway_name": row["pathway_name"],
+                    "baseline_rank": row["baseline_rank"],
+                    "ml_score": f"{float(row['ml_score']):.6g}" if row["ml_score"] is not None else "",
+                    "ml_rank": row["ml_rank"] if row["ml_rank"] is not None else "",
+                    "rerank_applied": str(bool(row["rerank_applied"])).lower(),
+                    "rerank_reason": row["rerank_reason"],
+                    "model_kind": row["model_kind"],
+                    "x_i": row["x_i"],
+                    "K_i": row["K_i"],
+                    "n": row["n"],
+                    "N": row["N"],
+                    "target_rate": f"{float(row['target_rate']):.6g}",
+                    "background_rate": f"{float(row['background_rate']):.6g}",
+                    "expected_hits": f"{float(row['expected_hits']):.6g}",
+                    "excess_hits": f"{float(row['excess_hits']):.6g}",
+                    "enrichment_factor": f"{float(row['enrichment_factor']):.6g}",
+                    "coverage": f"{float(row['coverage']):.6g}",
+                    "p_value": f"{float(row['p_value']):.6g}",
+                    "fdr": f"{float(row['fdr']):.6g}",
+                    "neg_log10_p": f"{float(row['neg_log10_p']):.6g}",
+                    "neg_log10_fdr": f"{float(row['neg_log10_fdr']):.6g}",
+                    "mapping_confidence_mean": f"{float(row['mapping_confidence_mean']):.6g}",
+                    "mapping_confidence_min": f"{float(row['mapping_confidence_min']):.6g}",
+                    "mapping_confidence_max": f"{float(row['mapping_confidence_max']):.6g}",
+                    "direct_hit_count": row["direct_hit_count"],
+                    "fuzzy_hit_count": row["fuzzy_hit_count"],
+                    "recovered_hit_count": row["recovered_hit_count"],
+                    "exact_structure_hit_count": row["exact_structure_hit_count"],
+                    "structural_neighbor_hit_count": row["structural_neighbor_hit_count"],
+                    "final_score": f"{float(row['final_score']):.4f}",
+                    "confidence_level": row["confidence_level"],
+                    "hit_compound_ids": row["hit_compound_ids"],
+                    "hit_compound_names": row["hit_compound_names"],
+                    "kegg_support_present": str(bool(row["kegg_support_present"])).lower(),
+                    "kegg_ath_pathway_id": row["kegg_ath_pathway_id"],
+                    "kegg_ath_pathway_name": row["kegg_ath_pathway_name"],
+                    "kegg_alignment_score": (
+                        f"{float(row['kegg_alignment_score']):.6g}" if row["kegg_support_present"] else ""
+                    ),
+                    "kegg_alignment_confidence": row["kegg_alignment_confidence"],
                 }
             )
 
@@ -558,6 +643,7 @@ def main() -> None:
 
     state = load_preprocessed_state(workdir, verbose=True)
     kegg_support_lookup: dict[str, KeggPathwaySupport] = state.get("kegg_pathway_support", {})
+    online_model_bundle, online_model_load_reason = load_online_model_bundle(workdir)
     pathway_index_path = workdir / "outputs" / "preprocessed" / "aracyc_compound_pathway_index.tsv"
     pathway_names, pathway_to_tokens, universe_tokens = _load_pathway_membership(pathway_index_path)
 
@@ -576,6 +662,69 @@ def main() -> None:
         compound_records,
         kegg_support_lookup,
     )
+    baseline_rank_by_id = {row.pathway_id: rank for rank, row in enumerate(enrichment_rows, start=1)}
+    rerank_reason = "applied"
+    rerank_applied = False
+    output_rows: list[dict[str, Any]] = []
+    online_model_kind = online_model_bundle["model_kind"] if online_model_bundle is not None else ""
+    online_candidate_policy = (
+        str(online_model_bundle["metadata"].get("online_candidate_policy") or ONLINE_CANDIDATE_POLICY)
+        if online_model_bundle is not None
+        else ONLINE_CANDIDATE_POLICY
+    )
+
+    if len(target_tokens) < 2:
+        rerank_reason = "single_compound_query"
+    elif not enrichment_rows:
+        rerank_reason = "no_candidates"
+    elif online_model_bundle is None:
+        rerank_reason = online_model_load_reason
+    else:
+        structure_lookup = ensure_chebi_structure_lookup(state, verbose=False)
+        parent_map = load_parent_map(workdir)
+        root_cache: dict[str, str] = {}
+        query_features = query_level_features_from_compound_ids(
+            [record.compound_id for record in compound_records.values()],
+            structure_lookup=structure_lookup,
+            parent_map=parent_map,
+            root_cache=root_cache,
+        )
+        feature_rows = [rerank_feature_values(row, query_features) for row in enrichment_rows]
+        ml_scores = predict_rerank_scores(online_model_bundle, feature_rows)
+        rerank_applied = True
+        ranked_indices = sorted(
+            range(len(enrichment_rows)),
+            key=lambda idx: (float(ml_scores[idx]), float(enrichment_rows[idx].final_score)),
+            reverse=True,
+        )
+        ml_rank_by_index = {idx: rank for rank, idx in enumerate(ranked_indices, start=1)}
+        for idx, row in enumerate(enrichment_rows):
+            output_rows.append(
+                _enrichment_output_row(
+                    row,
+                    baseline_rank=baseline_rank_by_id[row.pathway_id],
+                    ml_score=float(ml_scores[idx]),
+                    ml_rank=ml_rank_by_index[idx],
+                    rerank_applied=True,
+                    rerank_reason="applied",
+                    model_kind=online_model_kind,
+                )
+            )
+        output_rows.sort(key=lambda row: (int(row["ml_rank"]), int(row["baseline_rank"])))
+
+    if not output_rows:
+        for row in enrichment_rows:
+            output_rows.append(
+                _enrichment_output_row(
+                    row,
+                    baseline_rank=baseline_rank_by_id[row.pathway_id],
+                    ml_score=None,
+                    ml_rank=None,
+                    rerank_applied=False,
+                    rerank_reason=rerank_reason,
+                    model_kind=online_model_kind,
+                )
+            )
 
     input_list_path = out_prefix.with_name(out_prefix.name + "_input_compounds.txt")
     resolution_path = out_prefix.with_name(out_prefix.name + "_metabolite_resolution.tsv")
@@ -591,7 +740,7 @@ def main() -> None:
 
     _write_input_names(input_list_path, input_names)
     _write_resolution_output(resolution_path, rows)
-    _write_enrichment_output(enrichment_path, enrichment_rows, warning=warning)
+    _write_enrichment_output(enrichment_path, output_rows, warning=warning)
 
     resolved_count = sum(1 for row in rows if row.resolution_status == "resolved")
     ambiguous_count = sum(1 for row in rows if row.resolution_status == "ambiguous")
@@ -601,28 +750,40 @@ def main() -> None:
     print(f"Resolved: {resolved_count}, ambiguous: {ambiguous_count}, unmapped: {unmapped_count}", flush=True)
     print(f"n={len(target_tokens)}", flush=True)
     print(f"N={len(universe_tokens)}", flush=True)
+    if online_model_bundle is not None:
+        print(
+            f"Online rerank model loaded: {online_model_kind} "
+            f"(LightGBM {online_model_bundle['metadata'].get('lightgbm_version', '')})",
+            flush=True,
+        )
+        print(f"Online candidate policy: {online_candidate_policy}", flush=True)
+    if rerank_applied:
+        print(f"ML rerank applied: {len(enrichment_rows)} candidate pathways reranked.", flush=True)
+    else:
+        print(f"ML rerank skipped: {rerank_reason}", flush=True)
     print(f"Input list written: {input_list_path}", flush=True)
     print(f"Resolution audit written: {resolution_path}", flush=True)
-    print(f"Enriched pathways written: {len(enrichment_rows)} -> {enrichment_path}", flush=True)
-    if enrichment_rows:
+    print(f"Enriched pathways written: {len(output_rows)} -> {enrichment_path}", flush=True)
+    if output_rows:
         print("Top enriched pathways:", flush=True)
-        for row in enrichment_rows[:5]:
-            print(
-                f"  - {row.pathway_name} [{row.confidence_level}] "
-                f"x_i={row.x_i}, K_i={row.K_i}, n={row.n}, N={row.N}, "
-                f"EF={row.enrichment_factor:.4g}, p={row.p_value:.4g}, "
-                f"FDR={row.fdr:.4g}, score={row.final_score:.4f}",
-                flush=True,
+        row_lookup = {row.pathway_id: row for row in enrichment_rows}
+        for output_row in output_rows[:5]:
+            baseline_row = row_lookup[output_row["pathway_id"]]
+            summary = (
+                f"  - {baseline_row.pathway_name} [{baseline_row.confidence_level}] "
+                f"x_i={baseline_row.x_i}, K_i={baseline_row.K_i}, n={baseline_row.n}, N={baseline_row.N}, "
+                f"EF={baseline_row.enrichment_factor:.4g}, p={baseline_row.p_value:.4g}, "
+                f"FDR={baseline_row.fdr:.4g}, baseline_score={baseline_row.final_score:.4f}"
             )
-            print(
-                f"    hits: {'; '.join(row.hit_compound_names)}",
-                flush=True,
-            )
-            if row.kegg_support_present:
+            if output_row["rerank_applied"]:
+                summary += f", ml_score={float(output_row['ml_score']):.4f}"
+            print(summary, flush=True)
+            print(f"    hits: {'; '.join(baseline_row.hit_compound_names)}", flush=True)
+            if baseline_row.kegg_support_present:
                 print(
                     "    "
-                    f"KEGG ath support: {row.kegg_ath_pathway_id} ({row.kegg_ath_pathway_name}) "
-                    f"[{row.kegg_alignment_confidence}, score={row.kegg_alignment_score:.4f}]",
+                    f"KEGG ath support: {baseline_row.kegg_ath_pathway_id} ({baseline_row.kegg_ath_pathway_name}) "
+                    f"[{baseline_row.kegg_alignment_confidence}, score={baseline_row.kegg_alignment_score:.4f}]",
                     flush=True,
                 )
     else:
