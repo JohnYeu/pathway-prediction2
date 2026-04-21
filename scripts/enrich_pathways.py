@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Interactive/file-driven AraCyc pathway enrichment for a compound set."""
+"""Interactive/file-driven AraCyc pathway enrichment for a compound set.
+
+The enrichment CLI now has two layers:
+
+1. baseline AraCyc enrichment, which generates the candidate pathways and the
+   interpretable statistics (`x_i`, `EF`, `FDR`, hit compounds, confidence)
+2. optional online ML reranking, which reorders the same candidate set with a
+   published LightGBM model while preserving the baseline evidence
+
+The baseline statistics remain the source of truth for explanation; the online
+model only changes the default presentation order when a compatible deploy
+bundle is available.
+"""
 
 from __future__ import annotations
 
@@ -94,6 +106,8 @@ class PathwayEnrichmentRow:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for interactive or file-driven enrichment runs."""
+
     parser = argparse.ArgumentParser(description="Run AraCyc-only pathway enrichment for a set of compounds.")
     parser.add_argument("--workdir", default=".", help="Workspace root directory.")
     parser.add_argument("--out-prefix", default="", help="Optional output prefix.")
@@ -299,6 +313,13 @@ def _compute_enrichment(
     compound_records: dict[str, CompoundTargetRecord],
     kegg_support_lookup: dict[str, KeggPathwaySupport] | None = None,
 ) -> list[PathwayEnrichmentRow]:
+    """Compute baseline enrichment rows for all AraCyc pathways with `x_i >= 2`.
+
+    The output of this function is intentionally baseline-only. Any online ML
+    reranking happens later and consumes these rows as candidate pathways plus
+    their interpretable evidence.
+    """
+
     N = len(universe_tokens)
     n = len(target_tokens)
     raw_rows: list[dict[str, Any]] = []
@@ -469,6 +490,8 @@ def _write_resolution_output(path: Path, rows: list[InputMetaboliteRow]) -> None
 
 
 def _enrichment_output_fieldnames() -> list[str]:
+    """Return the TSV schema for the user-facing enrichment output."""
+
     return [
         "pathway_id",
         "pathway_name",
@@ -522,6 +545,8 @@ def _enrichment_output_row(
     rerank_reason: str,
     model_kind: str,
 ) -> dict[str, Any]:
+    """Convert one enrichment row plus optional rerank metadata into TSV output."""
+
     return {
         "pathway_id": row.pathway_id,
         "pathway_name": row.pathway_name,
@@ -566,6 +591,8 @@ def _enrichment_output_row(
 
 
 def _write_enrichment_output(path: Path, rows: list[dict[str, Any]], warning: str = "") -> None:
+    """Write the final enrichment table, including optional rerank metadata."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         if warning:
@@ -632,6 +659,8 @@ def _default_out_prefix(workdir: Path, input_path: Path | None) -> Path:
 
 
 def main() -> None:
+    """Run enrichment, then optionally apply online ML reranking."""
+
     args = parse_args()
     workdir = Path(args.workdir).resolve()
     input_path = Path(args.input).resolve() if args.input else None
@@ -662,6 +691,8 @@ def main() -> None:
         compound_records,
         kegg_support_lookup,
     )
+    # Baseline ranks are preserved even when ML reranking changes the default
+    # display order. This keeps the original enrichment evidence auditable.
     baseline_rank_by_id = {row.pathway_id: rank for rank, row in enumerate(enrichment_rows, start=1)}
     rerank_reason = "applied"
     rerank_applied = False
@@ -673,6 +704,8 @@ def main() -> None:
         else ONLINE_CANDIDATE_POLICY
     )
 
+    # The online reranker is only meaningful for compound sets. Single-compound
+    # queries keep the baseline ordering and expose the reason in the TSV.
     if len(target_tokens) < 2:
         rerank_reason = "single_compound_query"
     elif not enrichment_rows:
@@ -680,6 +713,8 @@ def main() -> None:
     elif online_model_bundle is None:
         rerank_reason = online_model_load_reason
     else:
+        # Build the exact same feature set used during model training so online
+        # predictions remain comparable to the published deploy bundle.
         structure_lookup = ensure_chebi_structure_lookup(state, verbose=False)
         parent_map = load_parent_map(workdir)
         root_cache: dict[str, str] = {}
@@ -692,6 +727,8 @@ def main() -> None:
         feature_rows = [rerank_feature_values(row, query_features) for row in enrichment_rows]
         ml_scores = predict_rerank_scores(online_model_bundle, feature_rows)
         rerank_applied = True
+        # The online model only reranks the baseline candidate set; it does not
+        # expand recall beyond the pathways returned by baseline enrichment.
         ranked_indices = sorted(
             range(len(enrichment_rows)),
             key=lambda idx: (float(ml_scores[idx]), float(enrichment_rows[idx].final_score)),

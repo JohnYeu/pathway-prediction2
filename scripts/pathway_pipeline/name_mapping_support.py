@@ -219,7 +219,13 @@ def build_plant_to_kegg_bridge(
     pubchem_to_kegg_index: dict[str, set[str]],
     kegg_structure_indexes: dict[str, dict[str, dict[str, set[str]]]],
 ) -> list[PlantToKeggBridge]:
-    """Bridge matched PMN records back to KEGG using curated and structural evidence."""
+    """Bridge matched PMN records back to KEGG using curated and structural evidence.
+
+    Step 2 ultimately chooses KEGG compounds, but some compounds first become
+    visible through AraCyc/PlantCyc records. This helper converts those PMN-side
+    hits into KEGG candidate rows so later scoring can compare them against
+    direct ChEBI, structure, and name-based evidence on equal footing.
+    """
 
     bridges: dict[tuple[str, str], dict[str, object]] = {}
 
@@ -288,6 +294,9 @@ def build_plant_to_kegg_bridge(
                     bridge_reason=f"{record.source_db} record {record.compound_id} bridges to {kegg_cid} via {chebi_id}",
                 )
 
+        # PMN records do not always carry an explicit InChIKey. When RDKit is
+        # available we derive one from the stored SMILES so exact structure
+        # bridges can still contribute to the KEGG rescue layer.
         record_inchi_key = ""
         if record.smiles and Chem is not None:
             try:
@@ -370,7 +379,14 @@ def build_candidate_mappings(
     name_formula_index: dict[str, set[str]],
     kegg_structure_indexes: dict[str, dict[str, dict[str, set[str]]]],
 ) -> list[CandidateMapping]:
-    """Build and score all KEGG candidates for one ChEBI compound."""
+    """Build and score all KEGG candidates for one ChEBI compound.
+
+    The candidate set deliberately merges multiple evidence families:
+    direct ChEBI cross-references, exact structure matches, PMN-derived plant
+    bridges, LIPID MAPS cross-links, strict KEGG name matches, and guarded
+    fuzzy corrections. Selection happens later; this function's job is to keep
+    the evidence space complete and scored.
+    """
 
     candidates: dict[str, CandidateMapping] = {}
 
@@ -385,6 +401,7 @@ def build_candidate_mappings(
             candidates[kegg_compound_id] = candidate
         return candidate
 
+    # Strongest evidence first: curated ChEBI -> KEGG cross-references.
     for kegg_id in sorted(xrefs.kegg_ids):
         if kegg_id in kegg_compounds:
             candidate_for(kegg_id).add_evidence(
@@ -395,6 +412,8 @@ def build_candidate_mappings(
                 external_source="ChEBI",
             )
 
+    # Exact structure evidence comes next and usually remains decisive even
+    # when no direct curated KEGG identifier exists.
     if structure and structure.standard_inchi_key:
         inchi_key = normalize_inchi_key(structure.standard_inchi_key)
         for kegg_id, sources in sorted(kegg_structure_indexes.get("by_inchi_key_full", {}).get(inchi_key, {}).items()):
@@ -410,6 +429,8 @@ def build_candidate_mappings(
                     has_structure_evidence=True,
                 )
 
+    # PMN bridges import Arabidopsis/plant-specific context into the KEGG
+    # matcher without changing the final KEGG-centric label space.
     for bridge in plant_bridge_rows:
         if bridge.kegg_cid not in kegg_compounds:
             continue
@@ -424,6 +445,8 @@ def build_candidate_mappings(
             arabidopsis_supported=bridge.arabidopsis_supported,
         )
 
+    # LIPID MAPS mainly helps lipid species where ChEBI/KEGG cross-references
+    # are sparse or nomenclature is especially noisy.
     for record_id, methods in context.matched_lipidmaps_methods.items():
         record = lipidmaps_records[record_id]
         if not record.kegg_ids:
@@ -454,6 +477,10 @@ def build_candidate_mappings(
                 has_structure_evidence=has_structure_evidence,
             )
 
+    # Name evidence is intentionally ordered from strict to relaxed:
+    # standard-name match -> alias-table match -> compact fuzzy correction with
+    # formula validation. This keeps aggressive typo rescue from outranking
+    # curated or structural evidence.
     for alias in context.all_aliases:
         matched_by_name = False
         for variant_name in VARIANT_ORDER:
@@ -526,6 +553,8 @@ def build_candidate_mappings(
                 used_pubchem_synonym=alias.source_type == "pubchem_synonym",
             )
 
+    # Final ordering still reflects provenance: direct/structural matches sort
+    # ahead of weaker name-only candidates with similar raw scores.
     ranked = sorted(
         candidates.values(),
         key=lambda item: (
@@ -549,7 +578,13 @@ def build_candidate_mappings(
 
 
 def select_candidates(ranked: list[CandidateMapping]) -> list[CandidateMapping]:
-    """Choose final mappings after evidence aggregation and ranking."""
+    """Choose final mappings after evidence aggregation and ranking.
+
+    The selection policy is intentionally conservative. Step 2 only emits final
+    KEGG mappings when the evidence is direct or clearly dominant; ambiguous
+    candidates remain visible in audit outputs but do not propagate as selected
+    mappings into later pathway steps.
+    """
 
     if not ranked:
         return []
@@ -603,7 +638,12 @@ def mapping_confidence_label(score: float) -> str:
 
 
 def write_name_to_kegg_index(context: PipelineContext) -> int:
-    """Write the canonical-name -> KEGG mapping index used by query step 2."""
+    """Write the canonical-name -> KEGG mapping index used by query step 2.
+
+    This is the compact runtime lookup consumed by query-time code. It stores
+    only trusted selected mappings so online flows do not need to re-evaluate
+    the full candidate space built during step 2.
+    """
 
     row_count = 0
     with context.paths.name_to_kegg_index_path.open("w", newline="", encoding="utf-8") as handle:

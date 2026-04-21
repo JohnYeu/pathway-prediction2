@@ -447,7 +447,13 @@ def ensure_plant_reactome_refs(
     gene_path: Path,
     version_path: Path,
 ) -> str:
-    """Download and materialize a local Plant Reactome snapshot if missing."""
+    """Download and materialize a local Plant Reactome snapshot if missing.
+
+    Plant Reactome is an auxiliary evidence source in this project, not a
+    primary label space. This helper snapshots just enough pathway metadata and
+    pathway->gene links to support annotation-time alignment and reporting while
+    keeping later steps fully local and reproducible.
+    """
 
     if pathways_path.exists() and gene_path.exists() and version_path.exists():
         raw_text = version_path.read_text(encoding="utf-8").strip()
@@ -659,7 +665,13 @@ def match_plant_reactome_context(
     plant_reactome_gene_sets: dict[str, set[str]],
     top_k: int = 3,
 ) -> list[dict[str, object]]:
-    """Match one KEGG pathway against Plant Reactome by name and gene overlap."""
+    """Match one KEGG pathway against Plant Reactome by name and gene overlap.
+
+    The output is meant for external-support annotation, not strict equivalence.
+    We surface the most plausible Plant Reactome companions so downstream
+    reports can say whether a KEGG pathway is also supported by another
+    Arabidopsis-focused pathway resource.
+    """
 
     normalized_name = normalize_name(pathway_name)
     compact_name = build_variants(pathway_name)["compact"]
@@ -696,6 +708,8 @@ def match_plant_reactome_context(
             or gene_jaccard >= 0.05
         ):
             continue
+        # Gene overlap carries most of the score; name and category agreement
+        # only refine otherwise plausible plant-context matches.
         alignment_score = (
             0.50 * gene_jaccard
             + 0.20 * overlap_ratio_kegg
@@ -745,7 +759,12 @@ def build_annotation_confidence(
     plant_evidence_sources: tuple[str, ...],
     plant_reactome_alignment_confidence: str,
 ) -> str:
-    """Assign a simple confidence level to the final annotation bundle."""
+    """Assign a simple confidence level to the final annotation bundle.
+
+    This confidence describes how richly supported the annotation payload is,
+    not whether the pathway itself is "correct". Independent evidence layers
+    such as BRITE, GO BP, PMN, and Plant Reactome push the bundle upward.
+    """
 
     if brite_l1 and (
         go_best_term
@@ -1059,7 +1078,14 @@ def build_annotation_row(
     pathway_name: str,
     ath_gene_sets: dict[str, set[str]],
 ) -> tuple[dict[str, object], Step5AnnotatedPathwayHit]:
-    """Build one fully annotated pathway record and its in-memory counterpart."""
+    """Build one fully annotated pathway record and its in-memory counterpart.
+
+    Step 5 feeds two consumers:
+    1. persisted pathway-level TSV indexes
+    2. per-hit in-memory objects attached to resolved compound->pathway hits
+    This helper builds both from a single annotation bundle so those views stay
+    synchronized.
+    """
 
     brite_l1, brite_l2, brite_l3 = context.pathway_categories.get(map_pathway_id, ("", "", ""))
     normalized_name = normalize_name(pathway_name)
@@ -1095,6 +1121,9 @@ def build_annotation_row(
         }
         gene_ids = set()
 
+    # Plant Reactome remains an auxiliary support layer. We keep a small ranked
+    # list so later reporting can explain cross-database agreement without
+    # changing the upstream KEGG/AraCyc pathway identity.
     plant_reactome_matches = match_plant_reactome_context(
         pathway_name=pathway_name,
         gene_ids=gene_ids,
@@ -1222,7 +1251,13 @@ def build_annotation_row(
 
 
 def run(context: PipelineContext) -> PipelineContext:
-    """Add pathway metadata needed for scoring and reporting."""
+    """Add pathway metadata needed for scoring and reporting.
+
+    This step does not choose pathways. It enriches already-resolved pathway
+    hits with KEGG BRITE labels, Arabidopsis GO BP summaries, PMN plant
+    evidence, and Plant Reactome alignments so later ranking, review, and
+    presentation layers can explain why a pathway is relevant.
+    """
 
     ensure_go_annotations(context.paths.gene_association_tair_path)
     context.go_vstamp = iso_mtime(context.paths.gene_association_tair_path)
@@ -1250,6 +1285,9 @@ def run(context: PipelineContext) -> PipelineContext:
     context.plant_reactome_pathways = load_plant_reactome_pathways(context.paths.plant_reactome_pathways_path)
     context.plant_reactome_gene_sets = load_plant_reactome_gene_index(context.paths.plant_reactome_gene_pathway_path)
 
+    # GO enrichment is only meaningful for ath pathways that actually have gene
+    # membership, so we build a KEGG-ath-specific background before annotating
+    # individual pathways.
     ath_gene_sets = load_ath_gene_sets(context.paths.kegg_ath_gene_pathway_path)
     kegg_ath_genes = set()
     for genes in ath_gene_sets.values():
@@ -1270,6 +1308,8 @@ def run(context: PipelineContext) -> PipelineContext:
     annotation_lookup: dict[str, Step5AnnotatedPathwayHit] = {}
     map_ids = sorted(set(context.map_pathways) | set(context.map_to_ath))
     for map_pathway_id in map_ids:
+        # Every map pathway gets a fallback annotation row so generic KEGG map
+        # IDs remain explainable even when no ath-specific projection exists.
         map_name = context.map_pathways.get(map_pathway_id, map_pathway_id)
         row, template = build_annotation_row(
             context=context,
@@ -1299,6 +1339,8 @@ def run(context: PipelineContext) -> PipelineContext:
         annotation_rows.append(row)
         annotation_lookup[ath_pathway_id] = template
 
+    # Copy the pathway-level annotation template onto each compound-level hit
+    # while preserving step-4 relation evidence such as reaction roles.
     annotated_hits: dict[str, list[Step5AnnotatedPathwayHit]] = {}
     for compound_id, hits in context.resolved_pathway_hits.items():
         annotated = []

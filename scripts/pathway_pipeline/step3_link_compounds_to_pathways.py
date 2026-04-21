@@ -134,7 +134,11 @@ def _read_compound_pathway_detail(
 
 
 def write_compound_pathway_index(context: PipelineContext) -> int:
-    """Write the AraCyc compound-to-pathway index."""
+    """Write the AraCyc compound-to-pathway index.
+
+    This index is the baseline bridge from resolved compounds to candidate
+    pathways and is reused by both online enrichment and downstream training.
+    """
     row_count = 0
     with context.paths.aracyc_compound_pathway_index_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
@@ -172,6 +176,67 @@ def write_compound_pathway_index(context: PipelineContext) -> int:
     return row_count
 
 
+def write_raw_pathway_hits_audit(context: PipelineContext) -> int:
+    """Write raw AraCyc pathway hits before annotation and scoring.
+
+    The audit table preserves the uncollapsed pathway hit evidence so later
+    review can distinguish linking issues from annotation or scoring issues.
+    """
+
+    row_count = 0
+    with context.paths.aracyc_raw_pathway_hits_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "chebi_name",
+                "hit_rank",
+                "aracyc_compound_id",
+                "aracyc_common_name",
+                "source_db",
+                "match_method",
+                "match_score",
+                "chebi_xref_direct",
+                "structure_validated",
+                "plant_record_id",
+                "reference_compound_key",
+                "pathway_id",
+                "pathway_name",
+                "ec_numbers",
+                "reaction_ids",
+                "reaction_equations",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for compound_id in sorted(context.aracyc_pathway_hits, key=int):
+            chebi_name = context.compounds.get(compound_id).name if compound_id in context.compounds else ""
+            for rank, hit in enumerate(context.aracyc_pathway_hits[compound_id], start=1):
+                writer.writerow({
+                    "compound_id": compound_id,
+                    "chebi_accession": f"CHEBI:{compound_id}",
+                    "chebi_name": chebi_name,
+                    "hit_rank": rank,
+                    "aracyc_compound_id": hit.match.aracyc_compound_id,
+                    "aracyc_common_name": hit.match.aracyc_common_name,
+                    "source_db": hit.source_db,
+                    "match_method": hit.match.match_method,
+                    "match_score": f"{hit.match.match_score:.4f}",
+                    "chebi_xref_direct": str(hit.match.chebi_xref_direct).lower(),
+                    "structure_validated": str(hit.match.structure_validated).lower(),
+                    "plant_record_id": hit.match.plant_record_id,
+                    "reference_compound_key": hit.match.reference_compound_key,
+                    "pathway_id": hit.pathway_id,
+                    "pathway_name": hit.pathway_name,
+                    "ec_numbers": ";".join(hit.ec_numbers),
+                    "reaction_ids": ";".join(hit.reaction_ids),
+                    "reaction_equations": " ; ".join(hit.reaction_equations),
+                })
+                row_count += 1
+    return row_count
+
+
 # ---------------------------------------------------------------------------
 # Step runner
 # ---------------------------------------------------------------------------
@@ -189,6 +254,8 @@ def run(context: PipelineContext) -> PipelineContext:
 
     print(f"    AraCyc pathways loaded: {len(pathway_info)}", flush=True)
 
+    # PlantCyc pathway metadata is only used as corroborating source metadata.
+    # AraCyc remains the authoritative source for gene / EC / reaction details.
     # Also load PlantCyc pathway info if available
     plantcyc_pathway_info: dict[str, AraCycPathwayInfo] = {}
     if context.paths.plantcyc_pathways_path.exists():
@@ -311,7 +378,10 @@ def run(context: PipelineContext) -> PipelineContext:
     # Write index
     n_idx = write_compound_pathway_index(context)
     print(f"    aracyc_compound_pathway_index: {n_idx} rows", flush=True)
+    n_raw_hits = write_raw_pathway_hits_audit(context)
+    print(f"    aracyc_raw_pathway_hits audit: {n_raw_hits} rows", flush=True)
 
     context.preprocess_counts["step3a_compounds_with_pathways"] = compounds_with_pathways
     context.preprocess_counts["step3a_total_pathway_hits"] = total_hits
+    context.preprocess_counts["step3a_raw_hit_rows"] = n_raw_hits
     return context

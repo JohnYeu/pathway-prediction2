@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Interactive TSV-driven training for compound-set -> pathway reranking."""
+"""Interactive TSV-driven training for compound-set -> pathway reranking.
+
+This script covers the full model lifecycle for the compound-set pathway
+reranker:
+
+1. resolve or generate labeled compound-set samples
+2. run sample-level baseline enrichment to build candidate pathways
+3. train a LightGBM ranking model on those candidate rows
+4. evaluate with single-split or cross-validation metrics
+5. optionally compute SHAP explanations
+6. optionally publish a deployable online model bundle
+
+The online query path intentionally reuses the feature construction logic from
+this script via `compound_set_rerank_shared.py` so the deployed model is scored
+with the same columns and semantics used at training time.
+"""
 
 from __future__ import annotations
 
@@ -107,6 +122,8 @@ class AuditRow:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for training, evaluation, and model publication."""
+
     parser = argparse.ArgumentParser(
         description="Train a compound-set -> pathway reranker from a user TSV dataset."
     )
@@ -219,6 +236,8 @@ def _ask_choice(prompt: str, choices: tuple[str, ...], *, default: str) -> str:
 
 
 def _interactive_config(args: argparse.Namespace, workdir: Path) -> dict[str, Any]:
+    """Resolve the final run configuration from flags plus interactive prompts."""
+
     dataset_mode = "custom_tsv" if args.dataset else "default_aracyc"
     dataset: Path | None = Path(args.dataset).resolve() if args.dataset else None
     cv_root = workdir / "outputs" / "crossValidation"
@@ -366,6 +385,8 @@ def _lightgbm_requirement_message(import_error: str) -> str:
 
 
 def _resolve_model_backend(*, allow_sklearn_fallback: bool) -> dict[str, Any]:
+    """Choose the training backend and document any fallback behavior."""
+
     if lgb is not None:
         return {
             "model_kind": "lightgbm_lambdarank",
@@ -394,6 +415,8 @@ def _resolve_model_backend(*, allow_sklearn_fallback: bool) -> dict[str, Any]:
 
 
 def _resolve_shap_backend(*, shap_enabled: bool, model_backend: dict[str, Any]) -> dict[str, Any]:
+    """Validate whether SHAP can run for the selected backend and flags."""
+
     if not shap_enabled:
         return {
             "shap_enabled": False,
@@ -537,6 +560,8 @@ def _resolve_dataset(
     pathway_names: dict[str, str],
     pathway_name_index: dict[str, str],
 ) -> tuple[list[ResolvedSample], list[AuditRow]]:
+    """Resolve a user TSV into normalized, labeled training samples plus audit rows."""
+
     resolved: list[ResolvedSample] = []
     audit: list[AuditRow] = []
 
@@ -808,6 +833,8 @@ def _generate_default_aracyc_dataset_for_compound_split(
     max_samples_per_pathway: int,
     rng: random.Random,
 ) -> tuple[list[ResolvedSample], dict[str, Any]]:
+    """Generate train/test samples for one compound-disjoint AraCyc split."""
+
     pathway_to_compounds: dict[str, set[str]] = {
         pathway_id: {
             token.split(":", 1)[1]
@@ -1183,6 +1210,18 @@ def _build_enrichment_rows(
     parent_map: dict[str, str],
     rng: random.Random,
 ) -> list[dict[str, Any]]:
+    """Build the truncated sample-level enrichment table consumed by model training.
+
+    Each row represents one `(sample_id, candidate_pathway)` pair with:
+
+    - baseline enrichment statistics
+    - mapping-quality features
+    - query-level chemistry features
+
+    The candidate policy deliberately mirrors the earlier ranking setup:
+    positive labels + top hard negatives + random negatives up to a fixed cap.
+    """
+
     rows: list[dict[str, Any]] = []
     all_pathway_ids = sorted(pathway_to_tokens)
     root_cache: dict[str, str] = {}
@@ -1200,6 +1239,8 @@ def _build_enrichment_rows(
         baseline_by_id = {row.pathway_id: row for row in baseline_rows}
         positive_ids = set(sample.pathway_ids)
 
+        # Keep the training candidate policy explicit and stable so offline
+        # metrics and published metadata can describe exactly what the model saw.
         hard_negatives = [
             row.pathway_id for row in baseline_rows if row.pathway_id not in positive_ids
         ][:DEFAULT_HARD_NEGATIVE_LIMIT]
@@ -1324,6 +1365,8 @@ def _train_model(
     *,
     model_kind: str,
 ) -> Any:
+    """Fit the ranking model (or explicit debug fallback) on pair rows."""
+
     X = _feature_frame(train_rows, feature_columns)
     y = np.asarray([int(row["label"]) for row in train_rows], dtype=int)
     base_sample_weight = np.asarray([float(row["sample_weight"]) for row in train_rows], dtype=float)
@@ -1608,6 +1651,8 @@ def _evaluate(
     baseline_key: str,
     model_key: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Evaluate baseline and ML ranking quality on held-out candidate rows."""
+
     grouped_raw: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped_raw[row["sample_id"]].append(row)
@@ -1914,6 +1959,8 @@ def _run_training_split(
     write_model: bool,
     fold_id: str,
 ) -> dict[str, Any]:
+    """Run one complete train/evaluate/export cycle for a split or one CV fold."""
+
     train_samples = [sample for sample in samples if sample.split == "train"]
     test_samples = [sample for sample in samples if sample.split == "test"]
     if not train_samples or not test_samples:
@@ -1943,6 +1990,8 @@ def _run_training_split(
     if not train_enrichment_rows or not test_enrichment_rows:
         raise SystemExit("Training or test enrichment candidate generation produced no rows.")
 
+    # The pair tables are derived directly from the persisted enrichment rows so
+    # training never silently recomputes a different candidate set.
     print(f"[{fold_id}] Deriving ranking pairs from enrichment candidates...", flush=True)
     train_rows = _pair_rows_from_enrichment_rows(train_enrichment_rows)
     test_rows = _pair_rows_from_enrichment_rows(test_enrichment_rows)
@@ -2227,6 +2276,13 @@ def _publish_online_model(
     max_samples_per_pathway: int,
     model_backend: dict[str, Any],
 ) -> Path:
+    """Train and publish the deployable online rerank model.
+
+    This intentionally retrains on all available data. The resulting deploy
+    model is therefore not identical to any single CV fold model, so the
+    published metadata records that CV metrics are reference-only.
+    """
+
     if model_backend["model_kind"] != "lightgbm_lambdarank":
         raise SystemExit("Cannot publish online model from sklearn_debug_fallback; publish requires lightgbm_lambdarank.")
 
@@ -2302,6 +2358,8 @@ def _publish_online_model(
 
 
 def main() -> None:
+    """Entry point for training, evaluation, CV aggregation, and publication."""
+
     args = parse_args()
     workdir = Path(args.workdir).resolve()
     config = _interactive_config(args, workdir)
@@ -2364,6 +2422,8 @@ def main() -> None:
     if config["dataset_mode"] == "custom_tsv":
         _assert_unique_sample_ids(resolved_samples)
 
+    # Single-split mode is used for explicit train/test runs, smoke tests, and
+    # the small training jobs that precede online model publication.
     if not config["cross_validation"]:
         if config["dataset_mode"] == "custom_tsv" and config["auto_split"] and not config["use_split_column"]:
             resolved_samples = _assign_auto_split(resolved_samples, rng)
@@ -2460,6 +2520,8 @@ def main() -> None:
 
     fold_payloads: list[tuple[str, list[ResolvedSample], dict[str, Any]]]
     split_strategy = "compound-disjoint"
+    # CV is evaluation-only. When publication is requested later, the deploy
+    # model is retrained separately on all available data.
     if config["dataset_mode"] == "default_aracyc":
         fold_payloads = _build_default_cv_samples(
             pathway_names=pathway_names,

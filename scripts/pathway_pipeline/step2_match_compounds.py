@@ -564,7 +564,12 @@ def _match_plantcyc_fallback(
 
 
 def write_name_to_aracyc_index(context: PipelineContext) -> int:
-    """Write the ChEBI -> AraCyc mapping index for query-time lookup."""
+    """Write the ChEBI -> AraCyc mapping index for query-time lookup.
+
+    This is the primary runtime lookup used by the single-compound query path,
+    so it keeps the best-supported matches with enough provenance to explain
+    why a user query resolved to a particular AraCyc compound.
+    """
 
     row_count = 0
     with context.paths.name_to_aracyc_index_path.open("w", newline="", encoding="utf-8") as handle:
@@ -641,6 +646,48 @@ def write_structure_aracyc_index(context: PipelineContext) -> int:
     return row_count
 
 
+def write_match_candidates_audit(
+    context: PipelineContext,
+    candidate_rows: list[dict[str, str]],
+) -> int:
+    """Write the full AraCyc/PlantCyc candidate space for manual review.
+
+    The audit table is intentionally wider than the runtime indexes. It exists
+    to inspect rejected or lower-ranked candidates when matching heuristics are
+    changed, without slowing down the query-time path.
+    """
+
+    with context.paths.aracyc_match_candidates_audit_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "compound_id",
+                "chebi_accession",
+                "chebi_name",
+                "selection_status",
+                "candidate_count",
+                "candidate_rank",
+                "is_selected",
+                "aracyc_compound_id",
+                "aracyc_common_name",
+                "source_db",
+                "match_method",
+                "match_score",
+                "chebi_xref_direct",
+                "structure_validated",
+                "pathway_count",
+                "pathways",
+                "plant_record_id",
+                "reference_compound_key",
+            ],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        for row in candidate_rows:
+            writer.writerow(row)
+    return len(candidate_rows)
+
+
 # ---------------------------------------------------------------------------
 # Step runner
 # ---------------------------------------------------------------------------
@@ -677,6 +724,8 @@ def run(context: PipelineContext) -> PipelineContext:
         flush=True,
     )
 
+    # AraCyc is the preferred target space for the active product flow, so its
+    # indexes and bridge methods define the primary matching path.
     # Build AraCyc indexes
     aracyc_chebi_idx = _build_chebi_xref_index(aracyc_records)
     aracyc_kegg_idx = _build_kegg_xref_index(aracyc_records)
@@ -687,6 +736,8 @@ def run(context: PipelineContext) -> PipelineContext:
     aracyc_fp_idx = _build_morgan_fp_index(aracyc_records)
     aracyc_formula_idx = _build_formula_key_index(aracyc_records)
 
+    # PlantCyc stays as a broader fallback layer. It helps recall, but because
+    # it is not Arabidopsis-specific it should not outrank a strong AraCyc hit.
     # Build PlantCyc indexes
     plantcyc_chebi_idx = _build_chebi_xref_index(plantcyc_records)
     plantcyc_kegg_idx = _build_kegg_xref_index(plantcyc_records)
@@ -703,6 +754,7 @@ def run(context: PipelineContext) -> PipelineContext:
     context.aracyc_matches_by_compound.clear()
     match_count = 0
     method_counts: dict[str, int] = defaultdict(int)
+    candidate_audit_rows: list[dict[str, str]] = []
 
     for compound_id in sorted(step1_rows, key=int):
         compound = context.compounds.get(compound_id)
@@ -727,6 +779,26 @@ def run(context: PipelineContext) -> PipelineContext:
                 match_count += 1
                 method_counts[best.match_method] += 1
                 context.aracyc_mapping_status[f"matched_{best.source_db.lower()}"] += 1
+                candidate_audit_rows.append({
+                    "compound_id": compound_id,
+                    "chebi_accession": f"CHEBI:{compound_id}",
+                    "chebi_name": compound.name,
+                    "selection_status": "selected",
+                    "candidate_count": "1",
+                    "candidate_rank": "1",
+                    "is_selected": "true",
+                    "aracyc_compound_id": best.aracyc_compound_id,
+                    "aracyc_common_name": best.aracyc_common_name,
+                    "source_db": best.source_db,
+                    "match_method": best.match_method,
+                    "match_score": f"{best.match_score:.4f}",
+                    "chebi_xref_direct": str(best.chebi_xref_direct).lower(),
+                    "structure_validated": str(best.structure_validated).lower(),
+                    "pathway_count": str(len(best.pathways)),
+                    "pathways": ";".join(best.pathways),
+                    "plant_record_id": best.plant_record_id,
+                    "reference_compound_key": best.reference_compound_key,
+                })
                 continue
             context.aracyc_mapping_status["step1_resolution_missing_record"] += 1
 
@@ -748,8 +820,49 @@ def run(context: PipelineContext) -> PipelineContext:
             match_count += 1
             method_counts[best.match_method] += 1
             context.aracyc_mapping_status[f"matched_{best.source_db.lower()}"] += 1
+            for rank, candidate in enumerate(matches, start=1):
+                candidate_audit_rows.append({
+                    "compound_id": compound_id,
+                    "chebi_accession": f"CHEBI:{compound_id}",
+                    "chebi_name": compound.name,
+                    "selection_status": "selected" if rank == 1 else "not_selected",
+                    "candidate_count": str(len(matches)),
+                    "candidate_rank": str(rank),
+                    "is_selected": str(rank == 1).lower(),
+                    "aracyc_compound_id": candidate.aracyc_compound_id,
+                    "aracyc_common_name": candidate.aracyc_common_name,
+                    "source_db": candidate.source_db,
+                    "match_method": candidate.match_method,
+                    "match_score": f"{candidate.match_score:.4f}",
+                    "chebi_xref_direct": str(candidate.chebi_xref_direct).lower(),
+                    "structure_validated": str(candidate.structure_validated).lower(),
+                    "pathway_count": str(len(candidate.pathways)),
+                    "pathways": ";".join(candidate.pathways),
+                    "plant_record_id": candidate.plant_record_id,
+                    "reference_compound_key": candidate.reference_compound_key,
+                })
         else:
             context.aracyc_mapping_status["no_match"] += 1
+            candidate_audit_rows.append({
+                "compound_id": compound_id,
+                "chebi_accession": f"CHEBI:{compound_id}",
+                "chebi_name": compound.name,
+                "selection_status": "no_match",
+                "candidate_count": "0",
+                "candidate_rank": "",
+                "is_selected": "false",
+                "aracyc_compound_id": "",
+                "aracyc_common_name": "",
+                "source_db": "",
+                "match_method": "",
+                "match_score": "",
+                "chebi_xref_direct": "false",
+                "structure_validated": "false",
+                "pathway_count": "0",
+                "pathways": "",
+                "plant_record_id": "",
+                "reference_compound_key": "",
+            })
 
     matched_aracyc_reference = {
         matches[0].reference_compound_key
@@ -770,8 +883,11 @@ def run(context: PipelineContext) -> PipelineContext:
 
     n_struct = write_structure_aracyc_index(context)
     print(f"    compound_structure_aracyc_index: {n_struct} rows", flush=True)
+    n_candidate_audit = write_match_candidates_audit(context, candidate_audit_rows)
+    print(f"    aracyc_match_candidates audit: {n_candidate_audit} rows", flush=True)
 
     context.preprocess_counts["step2a_aracyc_matched"] = match_count
     context.preprocess_counts["step2a_reference_compounds"] = total
     context.preprocess_counts["step2a_reference_matched"] = len(matched_aracyc_reference)
+    context.preprocess_counts["step2a_candidate_audit_rows"] = n_candidate_audit
     return context

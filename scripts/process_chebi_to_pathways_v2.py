@@ -1750,12 +1750,22 @@ def process_compounds(
     mapping_summary_path: Path,
     mapping_selected_path: Path,
 ) -> tuple[dict[str, list[CandidateMapping]], dict[str, StoredSupportContext], Counter[str], int]:
-    """Run alias expansion, KEGG mapping, and audit-table writing per compound."""
+    """Run alias expansion, KEGG mapping, and audit-table writing per compound.
+
+    This is the core matching phase of the legacy monolithic pipeline. It takes
+    the normalized ChEBI entities plus all external support tables, generates a
+    ranked candidate set for each compound, then writes both:
+
+    - wide audit tables for review
+    - the narrower selected mapping set used by later pathway expansion
+    """
 
     selected_by_compound: dict[str, list[CandidateMapping]] = {}
     support_contexts: dict[str, StoredSupportContext] = {}
     mapping_status: Counter[str] = Counter()
     alias_rows = 0
+    # Precompute exact bridge indexes before iterating per compound so the main
+    # loop can spend its time ranking evidence instead of rebuilding lookups.
     chebi_to_kegg_index = _build_chebi_to_kegg_bridge_index(compounds, xrefs)
     pubchem_to_kegg_index = _build_pubchem_to_kegg_bridge_index(xrefs, lipidmaps_records)
 
@@ -2016,7 +2026,13 @@ def write_pathway_table(
     reactome_pathways: dict[str, list[tuple[str, str]]],
     plantcyc_pathway_stats: dict[str, dict[str, dict[str, object]]],
 ) -> Counter[str]:
-    """Expand selected mappings to pathways and write the ranked output table."""
+    """Expand selected mappings to pathways and write the ranked output table.
+
+    This stage converts compound-level KEGG matches into user-facing pathway
+    recommendations. The output rows keep both the final score and a structured
+    rule-based explanation so later ML or SHAP layers can be compared against a
+    transparent baseline.
+    """
 
     pathway_status: Counter[str] = Counter()
     max_map_count = max(map_pathway_compound_counts.values(), default=1)
@@ -2216,7 +2232,11 @@ def build_summary(
     lipidmaps_records: dict[str, LipidMapsRecord],
     pubchem_stats: dict[str, int],
 ) -> dict[str, object]:
-    """Build the JSON summary used for quick run auditing."""
+    """Build the JSON summary used for quick run auditing.
+
+    The summary deliberately records database roles and caveats so a run can be
+    interpreted later without rereading the full code path.
+    """
 
     return {
         "compounds_total": len(compounds),
@@ -2252,13 +2272,24 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Wire together all loaders, matchers, scorers, and output writers."""
+    """Wire together all loaders, matchers, scorers, and output writers.
+
+    Even though the repository now favors the step-wise AraCyc-first flow, this
+    monolithic v2 script is still useful as a reference implementation and for
+    regenerating the broader KEGG/PlantCyc-supported tables.
+    """
 
     args = parse_args()
     workdir = Path(args.workdir).resolve()
     refs = workdir / "refs"
     outputs = workdir / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
+    name_mapping_dir = outputs / "nameMapping"
+    name_mapping_dir.mkdir(parents=True, exist_ok=True)
+    pathway_tables_dir = outputs / "pathwayTables"
+    pathway_tables_dir.mkdir(parents=True, exist_ok=True)
+    summaries_dir = outputs / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
     aracyc_compounds_path = latest_versioned_ref(refs, "aracyc_compounds", "aracyc_compounds.20230103")
     aracyc_pathways_path = latest_versioned_ref(refs, "aracyc_pathways", "aracyc_pathways.20230103")
     plantcyc_compounds_path = latest_versioned_ref(refs, "plantcyc_compounds", "plantcyc_compounds.20220103")
@@ -2358,13 +2389,13 @@ def main() -> None:
         kegg_primary_compact_delete_index=kegg_primary_compact_delete_index,
         name_formula_index=name_formula_index,
         kegg_structure_indexes=kegg_structure_indexes,
-        alias_output_path=outputs / "chebi_aliases_standardized_v2.tsv",
-        mapping_summary_path=outputs / "chebi_kegg_mapping_v2.tsv",
-        mapping_selected_path=outputs / "chebi_kegg_selected_v2.tsv",
+        alias_output_path=name_mapping_dir / "chebi_aliases_standardized_v2.tsv",
+        mapping_summary_path=name_mapping_dir / "chebi_kegg_mapping_v2.tsv",
+        mapping_selected_path=name_mapping_dir / "chebi_kegg_selected_v2.tsv",
     )
 
     pathway_status = write_pathway_table(
-        path=outputs / "chebi_pathways_ranked_v2.tsv",
+        path=pathway_tables_dir / "chebi_pathways_ranked_v2.tsv",
         compounds=compounds,
         selected_by_compound=selected_by_compound,
         support_contexts=support_contexts,
@@ -2388,7 +2419,7 @@ def main() -> None:
         lipidmaps_records=lipidmaps_records,
         pubchem_stats=pubchem_stats,
     )
-    with (outputs / "processing_summary_v2.json").open("w", encoding="utf-8") as handle:
+    with (summaries_dir / "processing_summary_v2.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
 
 

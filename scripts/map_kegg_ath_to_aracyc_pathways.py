@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Build a scored KEGG ath pathway -> AraCyc pathway alignment table."""
+"""Build a scored KEGG ath pathway -> AraCyc pathway alignment table.
+
+The goal here is not to declare strict biological equivalence. Instead, the
+script builds a practical alignment table that can be used for:
+
+- display-time support annotations
+- cross-database sanity checks
+- future external validation analyses
+
+Each edge is scored from pathway name similarity, Arabidopsis gene overlap, and
+compound overlap after mapping KEGG compounds into the project's ChEBI-centric
+compound key space.
+"""
 
 from __future__ import annotations
 
@@ -40,6 +52,8 @@ class AlignmentRow:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for KEGG-ath to AraCyc alignment generation."""
+
     parser = argparse.ArgumentParser(
         description="Build a scored alignment between KEGG ath pathways and AraCyc pathways."
     )
@@ -204,6 +218,8 @@ def _score_alignment(
     ath_compound_sets: dict[str, set[str]],
     aracyc_compound_sets: dict[str, set[str]],
 ) -> AlignmentRow:
+    """Score one KEGG-ath / AraCyc pathway pair using fixed evidence weights."""
+
     ath_genes = ath_gene_sets.get(ath_pathway_id, set())
     aracyc_genes = aracyc_gene_sets.get(aracyc_pathway_id, set())
     ath_compounds = ath_compound_sets.get(ath_pathway_id, set())
@@ -279,6 +295,8 @@ def _write_rows(path: Path, rows: list[AlignmentRow]) -> None:
 
 
 def main() -> None:
+    """Generate and write the full alignment table plus one best match per KEGG pathway."""
+
     args = parse_args()
     workdir = Path(args.workdir).resolve()
     refs = workdir / "refs"

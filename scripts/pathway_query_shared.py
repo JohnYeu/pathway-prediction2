@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Shared query-time resolution helpers for the AraCyc-first pipeline."""
+"""Shared query-time resolution helpers for the AraCyc-first pipeline.
+
+This module contains the runtime used by the single-compound query CLI. It
+loads preprocessed lookup tables, resolves a query through exact/fuzzy/structure
+paths, aggregates pathway evidence, and formats the result for terminal output.
+
+It deliberately stays separate from the compound-set reranker. Compound-set
+queries use `enrich_pathways.py`, which consumes baseline enrichment rows and an
+optional published LightGBM model.
+"""
 
 from __future__ import annotations
 
@@ -1324,7 +1333,7 @@ def run_query(
     top_k: int = 10,
     no_fuzzy: bool = False,
 ) -> QueryResult:
-    """Run a full query: resolve name/structure → find mappings → rank pathways."""
+    """Run the full single-compound query cascade and return ranked pathway evidence."""
     text = query.strip()
     if not text:
         return QueryResult(
@@ -1411,7 +1420,7 @@ def resolve_primary_compound(
     *,
     no_fuzzy: bool = False,
 ) -> PrimaryCompoundResolution:
-    """Resolve one metabolite name into one primary compound for batch analysis."""
+    """Resolve one metabolite name into one primary compound for batch workflows."""
 
     result = run_query(query, state, top_k=1, no_fuzzy=no_fuzzy)
     if result.resolution_path.endswith("ambiguous"):
@@ -1472,7 +1481,7 @@ def resolve_primary_compound(
 
 
 def print_result(result: QueryResult, top_k: int = 10) -> None:
-    """Pretty-print query results."""
+    """Pretty-print query results with pathway evidence and KEGG support."""
 
     print(f"\n{'='*70}")
     print(f"Query: {result.query}")
@@ -1546,7 +1555,7 @@ def print_result(result: QueryResult, top_k: int = 10) -> None:
 
 
 def load_preprocessed_state(workdir: Path, verbose: bool = True) -> dict[str, Any]:
-    """Load the active preprocessed indexes for query-time use."""
+    """Load the active preprocessed indexes and lazy caches for query-time use."""
     preprocessed_dir = workdir / "outputs" / "preprocessed"
     outputs_dir = workdir / "outputs"
     pathway_tables_dir = outputs_dir / "pathwayTables"

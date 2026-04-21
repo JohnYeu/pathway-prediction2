@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Shared helpers for compound-set -> pathway reranking."""
+"""Shared helpers for compound-set -> pathway reranking.
+
+This module exists to keep training-time and online-time feature construction
+identical. The training script and the online enrichment CLI both need:
+
+- the same query-level chemistry features
+- the same per-(query, pathway) enrichment feature layout
+- the same feature column ordering when calling LightGBM
+- a stable on-disk location for the published online model bundle
+
+Keeping those helpers here prevents the online CLI from silently drifting away
+from the model that was actually trained and published.
+"""
 
 from __future__ import annotations
 
@@ -22,10 +34,14 @@ ONLINE_CANDIDATE_POLICY = "baseline_enrichment_rows_x_i_ge_2_only"
 
 
 def online_model_dir(workdir: Path) -> Path:
+    """Return the fixed deployment directory for the online rerank model."""
+
     return workdir / "outputs" / "onlineModels" / "compound_set_pathway_rerank"
 
 
 def load_parent_map(workdir: Path) -> dict[str, str]:
+    """Load the ChEBI parent map used for ontology diversity features."""
+
     parent_map: dict[str, str] = {}
     with (workdir / "compounds.tsv").open(newline="", encoding="utf-8") as handle:
         import csv
@@ -39,6 +55,8 @@ def load_parent_map(workdir: Path) -> dict[str, str]:
 
 
 def root_ancestor(compound_id: str, parent_map: dict[str, str], cache: dict[str, str]) -> str:
+    """Return the root ancestor for a compound in the ChEBI parent tree."""
+
     cached = cache.get(compound_id)
     if cached is not None:
         return cached
@@ -54,6 +72,8 @@ def root_ancestor(compound_id: str, parent_map: dict[str, str], cache: dict[str,
 
 
 def ensure_fingerprint(record: Any) -> Any:
+    """Populate and return an RDKit fingerprint for a structure record."""
+
     if record is None:
         return None
     if getattr(record, "fingerprint", None) is not None:
@@ -68,6 +88,8 @@ def ensure_fingerprint(record: Any) -> Any:
 
 
 def pairwise_tanimoto(compound_ids: list[str], structure_lookup: dict[str, Any]) -> tuple[float, float, float]:
+    """Summarize pairwise structural similarity inside one compound set."""
+
     if DataStructs is None or len(compound_ids) < 2:
         return 0.0, 0.0, 0.0
     values: list[float] = []
@@ -94,6 +116,8 @@ def query_level_features_from_compound_ids(
     parent_map: dict[str, str],
     root_cache: dict[str, str],
 ) -> dict[str, float]:
+    """Compute the query-level features shared by training and online rerank."""
+
     tan_mean, tan_max, tan_min = pairwise_tanimoto(compound_ids, structure_lookup)
     formula_keys = {
         getattr(structure_lookup.get(compound_id), "formula_key", "")
@@ -119,6 +143,8 @@ def query_level_features_from_compound_ids(
 
 
 def compound_records_from_items(items: list[Any]) -> dict[str, Any]:
+    """Project resolved compounds into the minimal enrichment input schema."""
+
     from enrich_pathways import CompoundTargetRecord
 
     records: dict[str, Any] = {}
@@ -136,6 +162,8 @@ def rerank_feature_values(
     pathway_row: Any,
     query_features: dict[str, float],
 ) -> dict[str, float]:
+    """Convert one enrichment row plus query features into model features."""
+
     return {
         "baseline_score": float(pathway_row.final_score),
         "x_i": float(pathway_row.x_i),
@@ -165,6 +193,8 @@ def rerank_feature_values(
 
 
 def feature_frame(rows: list[dict[str, Any]], feature_columns: list[str]) -> pd.DataFrame:
+    """Build a feature matrix with a stable, explicit column order."""
+
     if not rows:
         return pd.DataFrame(columns=feature_columns, dtype=float)
     return pd.DataFrame(
@@ -175,6 +205,8 @@ def feature_frame(rows: list[dict[str, Any]], feature_columns: list[str]) -> pd.
 
 
 def load_online_model_bundle(workdir: Path) -> tuple[dict[str, Any] | None, str]:
+    """Load the published online model bundle or return a structured failure reason."""
+
     model_dir = online_model_dir(workdir)
     model_path = model_dir / "model.pkl"
     metadata_path = model_dir / "metadata.json"
@@ -209,5 +241,7 @@ def load_online_model_bundle(workdir: Path) -> tuple[dict[str, Any] | None, str]
 
 
 def predict_rerank_scores(model_bundle: dict[str, Any], feature_rows: list[dict[str, Any]]) -> np.ndarray:
+    """Score rerank feature rows with the published online LightGBM model."""
+
     X = feature_frame(feature_rows, model_bundle["feature_columns"])
     return np.asarray(model_bundle["model"].predict(X), dtype=float)

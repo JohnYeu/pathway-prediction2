@@ -1,4 +1,16 @@
-"""Shared state containers for the refactored step-wise pathway pipeline."""
+"""Shared state containers for the refactored step-wise pathway pipeline.
+
+`PipelinePaths` centralizes every well-known input/output path so the step
+modules do not reconstruct file locations ad hoc. `PipelineContext` is the
+mutable object that each step reads from and writes to; together they make the
+step-wise pipeline explicit and debuggable.
+
+This file is intentionally verbose because most maintenance work in the
+step-wise pipeline starts with answering two questions:
+
+1. which file is supposed to exist at this point?
+2. which in-memory field should already be populated by an earlier step?
+"""
 
 from __future__ import annotations
 
@@ -313,6 +325,9 @@ class PipelinePaths:
     workdir: Path
     refs: Path
     outputs: Path
+    review_dir: Path
+    review_step2_dir: Path
+    review_step3_dir: Path
     compounds_path: Path
     comments_path: Path
     chebi_names_path: Path
@@ -378,6 +393,8 @@ class PipelinePaths:
     aracyc_compound_pathway_index_path: Path
     aracyc_pathway_annotation_index_path: Path
     aracyc_pathway_output_path: Path
+    aracyc_match_candidates_audit_path: Path
+    aracyc_raw_pathway_hits_path: Path
 
     expanded_candidates_path: Path
     ml_training_pairs_path: Path
@@ -389,12 +406,28 @@ class PipelinePaths:
 
     @classmethod
     def from_workdir(cls, workdir: Path, output_tag: str = "refactored") -> "PipelinePaths":
-        """Construct a path bundle from the workspace root."""
+        """Construct a path bundle from the workspace root.
+
+        The directory creation is centralized here so each step can assume its
+        output parent directories already exist before writing TSV/JSON assets.
+        """
 
         workdir = workdir.resolve()
         refs = workdir / "refs"
         outputs = workdir / "outputs"
         outputs.mkdir(parents=True, exist_ok=True)
+        review_dir = outputs / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        review_step2_dir = review_dir / "step2"
+        review_step2_dir.mkdir(parents=True, exist_ok=True)
+        review_step3_dir = review_dir / "step3"
+        review_step3_dir.mkdir(parents=True, exist_ok=True)
+        name_mapping_dir = outputs / "nameMapping"
+        name_mapping_dir.mkdir(parents=True, exist_ok=True)
+        pathway_tables_dir = outputs / "pathwayTables"
+        pathway_tables_dir.mkdir(parents=True, exist_ok=True)
+        summaries_dir = outputs / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
         preprocessed_dir = outputs / "preprocessed"
         preprocessed_dir.mkdir(parents=True, exist_ok=True)
         preprocessed_history_dir = preprocessed_dir / "history"
@@ -408,6 +441,9 @@ class PipelinePaths:
             workdir=workdir,
             refs=refs,
             outputs=outputs,
+            review_dir=review_dir,
+            review_step2_dir=review_step2_dir,
+            review_step3_dir=review_step3_dir,
             compounds_path=workdir / "compounds.tsv",
             comments_path=workdir / "comments.tsv",
             chebi_names_path=refs / "names.tsv.gz",
@@ -441,11 +477,11 @@ class PipelinePaths:
             preprocessed_dir=preprocessed_dir,
             step1_result_path=preprocessed_dir / "step1_result.tsv",
             step1_alias_unified_path=preprocessed_dir / "step1_alias_unified.tsv",
-            alias_output_path=outputs / f"chebi_aliases_standardized{suffix}.tsv",
-            mapping_summary_path=outputs / f"chebi_kegg_mapping{suffix}.tsv",
-            mapping_selected_path=outputs / f"chebi_kegg_selected{suffix}.tsv",
-            pathway_output_path=outputs / f"chebi_pathways_ranked{suffix}.tsv",
-            summary_output_path=outputs / f"processing_summary{suffix}.json",
+            alias_output_path=name_mapping_dir / f"chebi_aliases_standardized{suffix}.tsv",
+            mapping_summary_path=name_mapping_dir / f"chebi_kegg_mapping{suffix}.tsv",
+            mapping_selected_path=name_mapping_dir / f"chebi_kegg_selected{suffix}.tsv",
+            pathway_output_path=pathway_tables_dir / f"chebi_pathways_ranked{suffix}.tsv",
+            summary_output_path=summaries_dir / f"processing_summary{suffix}.json",
             name_normalization_index_path=preprocessed_dir / "name_normalization_index.tsv",
             name_to_formula_index_path=preprocessed_dir / "name_to_formula_index.tsv",
             name_to_kegg_index_path=preprocessed_dir / "name_to_kegg_index.tsv",
@@ -471,7 +507,9 @@ class PipelinePaths:
             compound_structure_aracyc_index_path=preprocessed_dir / "compound_structure_aracyc_index.tsv",
             aracyc_compound_pathway_index_path=preprocessed_dir / "aracyc_compound_pathway_index.tsv",
             aracyc_pathway_annotation_index_path=preprocessed_dir / "aracyc_pathway_annotation_index.tsv",
-            aracyc_pathway_output_path=outputs / f"chebi_pathways_aracyc{suffix}.tsv",
+            aracyc_pathway_output_path=pathway_tables_dir / f"chebi_pathways_aracyc{suffix}.tsv",
+            aracyc_match_candidates_audit_path=review_step2_dir / f"aracyc_match_candidates{suffix}.tsv",
+            aracyc_raw_pathway_hits_path=review_step3_dir / f"aracyc_raw_pathway_hits{suffix}.tsv",
             expanded_candidates_path=preprocessed_dir / "compound_to_external_pathway_candidates.tsv",
             ml_training_pairs_path=preprocessed_dir / "ml_training_pairs.tsv",
             ml_pathway_predictions_path=preprocessed_dir / "ml_pathway_predictions.tsv",
@@ -528,7 +566,13 @@ class PipelinePaths:
 
 @dataclass
 class PipelineContext:
-    """Mutable state passed from one step module to the next."""
+    """Mutable state passed from one step module to the next.
+
+    The context deliberately keeps both legacy KEGG-centric fields and the
+    newer AraCyc-first fields because the repository still contains both flows.
+    The active preprocessing chain only uses a subset, but keeping them in one
+    dataclass makes cross-step expectations visible in one place.
+    """
 
     paths: PipelinePaths
     refresh_step3_kegg: bool = False
